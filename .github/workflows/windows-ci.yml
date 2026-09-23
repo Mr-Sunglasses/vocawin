@@ -97,6 +97,18 @@ jobs:
         run: npm ci
       - name: Build frontend
         run: npm run build
+      - name: Verify Windows dependency graph excludes GTK glib
+        shell: pwsh
+        run: |
+          $tree = cargo tree --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --locked --edges normal,build --prefix none
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $glib = $tree | Select-String -Pattern '^glib v'
+          if ($glib) {
+            $glib
+            Write-Error 'GTK glib is present in the Windows dependency graph.'
+            exit 1
+          }
+          Write-Output 'GTK glib is absent from the Windows dependency graph.'
       # Compiles cfg(windows) injection, Vulkan-enabled whisper-rs, and the
       # Tauri command layer. Does not require a physical GPU or microphone.
       - name: Test Rust command layer
