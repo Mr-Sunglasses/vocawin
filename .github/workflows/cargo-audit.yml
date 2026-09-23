@@ -24,10 +24,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - run: cargo install --locked cargo-audit --version 0.22.2
       # GTK glib appears in Cargo.lock for non-Windows targets. Windows CI
       # separately proves glib is absent from the Windows build graph.
