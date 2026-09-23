@@ -1,0 +1,34 @@
+name: Cargo security audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src-tauri/Cargo.toml'
+      - 'src-tauri/Cargo.lock'
+      - '.github/workflows/cargo-audit.yml'
+  pull_request:
+    paths:
+      - 'src-tauri/Cargo.toml'
+      - 'src-tauri/Cargo.lock'
+      - '.github/workflows/cargo-audit.yml'
+  schedule:
+    - cron: '47 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install --locked cargo-audit --version 0.22.2
+      # GTK glib appears in Cargo.lock for non-Windows targets. Windows CI
+      # separately proves glib is absent from the Windows build graph.
+      - run: cargo audit --file src-tauri/Cargo.lock --ignore RUSTSEC-2024-0429
