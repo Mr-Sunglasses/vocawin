@@ -1,0 +1,4 @@
+# Shared fixtures and emoji tables are compared byte for byte with the
+# VocaMac and VocaPhone copies; keep LF on every checkout.
+src-tauri/tests/fixtures/** text eol=lf
+src-tauri/resources/emoji/** text eol=lf

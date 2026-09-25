@@ -1427,6 +1427,8 @@ pub(crate) mod fixtures {
         let mut mode = String::new();
         let mut cases = Vec::new();
         for (offset, line) in text.split('\n').enumerate() {
+            // A Windows checkout may turn the file's line endings into CRLF.
+            let line = line.strip_suffix('\r').unwrap_or(line);
             if let Some(rest) = line.strip_prefix("## ") {
                 mode = rest.trim().to_string();
                 continue;

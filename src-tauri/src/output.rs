@@ -1362,6 +1362,12 @@ mod tests {
             }
             .unwrap_or_else(|error| panic!("could not create a {name} window: {error}"));
             if !focus(hwnd) {
+                // GitHub's Windows runners have an interactive desktop, so a
+                // skip there would hide a regression: fail instead.
+                assert!(
+                    std::env::var_os("GITHUB_ACTIONS").is_none(),
+                    "{name}: could not take the foreground on the CI runner"
+                );
                 eprintln!("skipping {name}: this session cannot take the foreground");
                 unsafe {
                     let _ = DestroyWindow(hwnd);
