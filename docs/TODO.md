@@ -30,6 +30,13 @@ This checklist tracks the path from the current local-recognition foundation to 
 - [x] Settings search + Mic Test (level) + Test Dictation (recognize, no inject)
 - [x] Searchable language list + Auto-detect
 - [x] No-model honesty (never “no speech was recognized” when none installed)
+- [x] VocaMac parity: recording overlay pill and launch-ready pill (non-focusable, top or bottom)
+- [x] VocaMac parity: Escape cancels while recording or transcribing (hook consumes Escape only while armed)
+- [x] VocaMac parity: hands-free shortcut, paste-last shortcut, middle/side mouse button (WH_MOUSE_LL only while bound)
+- [x] VocaMac parity: history search, copy, replay, retry, delete; audio saved before transcription; retention
+- [x] VocaMac parity: rule cleanup (hesitations, stutters, spoken corrections), spoken numbers/symbols/emoji (shared VocaPhone fixtures), dictionary replacements + vocabulary spelling for every engine, snippets
+- [x] VocaMac parity: silence trim before transcription, mute other apps while recording, usage stats, settings export/import, grouped sidebar with search, setup guide
+- [ ] Dictionary near-miss (fuzzy) matching and multi-letter stutter/cut-off word cleanup (need a Windows spelling oracle)
 
 ## Windows product quality
 
