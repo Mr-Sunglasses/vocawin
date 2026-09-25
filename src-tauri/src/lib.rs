@@ -3881,6 +3881,69 @@ fn tray_toggle_login(app: &AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 50 s of tone with a 0.4 s gap near each 16.7 s split, so it decodes
+    /// as three windows.
+    fn three_window_take() -> Vec<f32> {
+        let tone = |seconds: f32| -> Vec<f32> {
+            (0..(seconds * 16_000.0) as usize)
+                .map(|i| (i as f32 * 0.07).sin() * 0.3)
+                .collect()
+        };
+        let mut pcm = tone(16.5);
+        pcm.extend(vec![0.0; 6_400]);
+        pcm.extend(tone(16.5));
+        pcm.extend(vec![0.0; 6_400]);
+        pcm.extend(tone(16.2));
+        pcm
+    }
+
+    #[test]
+    fn short_takes_are_decoded_in_one_call() {
+        let pcm = vec![0.1; 16_000 * 5];
+        let mut calls = Vec::new();
+        let text = decode_in_windows(&pcm, |window| {
+            calls.push(window.len());
+            Ok(" hello ".into())
+        })
+        .unwrap();
+        assert_eq!(calls, vec![pcm.len()]);
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn window_texts_join_in_order_without_empty_ones() {
+        let pcm = three_window_take();
+        let mut index = 0;
+        let text = decode_in_windows(&pcm, |_| {
+            index += 1;
+            Ok(match index {
+                1 => " first part ".into(),
+                2 => "   ".into(),
+                _ => "third part".into(),
+            })
+        })
+        .unwrap();
+        assert_eq!(index, 3);
+        assert_eq!(text, "first part third part");
+    }
+
+    #[test]
+    fn a_failed_window_fails_the_take() {
+        let pcm = three_window_take();
+        let mut calls = 0;
+        let result = decode_in_windows(&pcm, |_| {
+            calls += 1;
+            if calls == 2 {
+                Err("Canary transcription failed: boom".into())
+            } else {
+                Ok("text".into())
+            }
+        });
+        assert_eq!(result, Err("Canary transcription failed: boom".into()));
+        assert_eq!(calls, 2);
+    }
+
     #[test]
     fn catalog_has_unique_ids_and_voca_engines() {
         let catalog = model_catalog();
