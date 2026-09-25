@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main VocaWin window",
-  "windows": ["main"],
+  "description": "Main VocaWin window and the dictation overlay",
+  "windows": ["main", "overlay"],
   "permissions": [
     "core:default",
     "autostart:allow-enable",

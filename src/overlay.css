@@ -1,0 +1,23 @@
+/* The on-screen pill. The window is transparent and sized to the pill; only
+   the pill itself is drawn. Same look in light and dark: it floats over any
+   app, so it carries its own dark surface. */
+:root{--pill:#0b1a15e8;--ink:#f2f6f2;--muted:#b9c7c0;--brand:#77d0b2;--warn:#f0b36a;--edge:#ffffff1f}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:transparent;overflow:hidden;font-family:"Segoe UI Variable","Segoe UI",sans-serif;-webkit-user-select:none;user-select:none}
+body{display:grid;place-items:center}
+.pill{display:flex;align-items:center;gap:10px;width:max-content;height:44px;max-width:412px;cursor:default;padding:0 18px 0 14px;border-radius:22px;background:var(--pill);border:1px solid var(--edge);box-shadow:0 4px 14px #0005;color:var(--ink);font-size:13px;line-height:1;white-space:nowrap;animation:enter .18s ease-out}
+.pill[hidden]{display:none}
+.pill .mark{flex:none;width:22px;height:22px;border-radius:50%;background:#0f6b57;display:grid;place-items:center}
+.pill .mark svg{width:12px;height:12px}
+.pill strong{font-weight:650}
+.pill .detail{color:var(--muted);overflow:hidden;text-overflow:ellipsis}
+.pill.error .mark{background:#8a4b12}
+.bars{display:flex;align-items:center;gap:3px;height:22px}
+.bars i{display:block;width:4px;height:4px;border-radius:2px;background:var(--brand);transition:height .06s linear}
+.live-dot{flex:none;width:8px;height:8px;border-radius:50%;background:#ff6b5f;animation:pulse 1.2s ease-in-out infinite}
+.hint{color:var(--muted);font-size:11px}
+.spinner{flex:none;width:16px;height:16px;border-radius:50%;border:2px solid #ffffff33;border-top-color:var(--brand);animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes pulse{50%{opacity:.35}}
+@keyframes enter{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){.pill,.live-dot,.spinner{animation:none}.bars i{transition:none}}

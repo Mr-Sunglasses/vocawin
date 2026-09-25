@@ -59,6 +59,31 @@ pub fn apply_output_polish(text: &str, auto_capitalize: bool, trailing_space: bo
     result
 }
 
+/// Wait until Ctrl, Alt, Shift and Win are all up, or `timeout` passes.
+/// Text typed while a shortcut's modifiers are still held would arrive as
+/// shortcuts instead (paste-last fires on key-down).
+pub fn wait_for_modifiers_released(timeout: std::time::Duration) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+        const MODIFIERS: [i32; 5] = [0x10, 0x11, 0x12, 0x5B, 0x5C];
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let held = MODIFIERS
+                .iter()
+                .any(|vk| (unsafe { GetAsyncKeyState(*vk) } as u16) & 0x8000 != 0);
+            if !held {
+                // Let the key-up reach the target app before typing.
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = timeout;
+}
+
 /// Controls whether dictation is also left on the system clipboard.
 ///
 /// Matches VocaLinux `copy_to_clipboard` (default off) and VocaMac

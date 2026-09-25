@@ -3,16 +3,26 @@
 
 mod autopause;
 mod autostart;
+mod cleanup;
 mod devices;
+mod dictionary;
+mod ducking;
 mod gpu;
 mod hardware;
+mod history;
 mod hook;
 mod hotkey;
 mod logbuf;
 mod machine;
 mod output;
+mod overlay;
+mod pipeline;
 mod power;
+mod silence;
 mod sounds;
+mod spoken_emoji;
+mod spoken_numbers;
+mod stats;
 mod vocabulary;
 mod whisper_cache;
 
@@ -27,7 +37,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::Mutex,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -201,7 +211,7 @@ fn model_catalog() -> Vec<Model> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 struct Settings {
     hotkey: String,
     activation_mode: String,
@@ -248,10 +258,77 @@ struct Settings {
     /// Off by default so insertion does not take over whatever was copied.
     #[serde(default)]
     copy_to_clipboard: bool,
+    /// VocaMac cleanup level without a model: `medium` removes "um"/"uh",
+    /// single-letter stutters, and spoken corrections; `none` keeps every word.
+    #[serde(default = "default_cleanup_level")]
+    cleanup_level: String,
+    /// "twenty three" → 23. Off by default, like VocaMac.
+    #[serde(default)]
+    numbers_as_digits: bool,
+    /// With digits: "50%", "$5.50", "21st", "June 22".
+    #[serde(default)]
+    number_symbols: bool,
+    /// "party emoji" → 🎉.
+    #[serde(default)]
+    spoken_emoji: bool,
+    /// Personal dictionary replacements, for every engine.
+    #[serde(default)]
+    replacements: Vec<dictionary::Replacement>,
+    #[serde(default)]
+    snippets: Vec<dictionary::Snippet>,
+    /// Escape throws away a dictation while it records or transcribes.
+    #[serde(default = "default_true")]
+    escape_cancels: bool,
+    /// Separate start/stop shortcut. Empty means none.
+    #[serde(default)]
+    hands_free_hotkey: String,
+    /// Types the last dictation again. Empty means none.
+    #[serde(default)]
+    paste_last_hotkey: String,
+    /// `middle`, `x1`, `x2`, or empty for no mouse button.
+    #[serde(default)]
+    mouse_button: String,
+    /// On-screen pill while dictating: `minimal` or `off`.
+    #[serde(default = "default_overlay_style")]
+    overlay_style: String,
+    /// `bottom` or `top` of the screen.
+    #[serde(default = "default_overlay_position")]
+    overlay_position: String,
+    /// "VocaWin is ready" pill for a few seconds after launch.
+    #[serde(default = "default_true")]
+    ready_pill: bool,
+    /// Cut silence before the model hears the recording.
+    #[serde(default = "default_true")]
+    skip_silence: bool,
+    /// Mute other apps' sound while recording.
+    #[serde(default)]
+    mute_other_audio: bool,
+    /// Days to keep history; 0 keeps it forever.
+    #[serde(default = "default_history_retention_days")]
+    history_retention_days: u32,
+    /// Keep recent takes' audio for replay and retry.
+    #[serde(default = "default_true")]
+    history_keep_audio: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_cleanup_level() -> String {
+    "medium".into()
+}
+
+fn default_overlay_style() -> String {
+    "minimal".into()
+}
+
+fn default_overlay_position() -> String {
+    "bottom".into()
+}
+
+fn default_history_retention_days() -> u32 {
+    30
 }
 
 fn default_max_recording_seconds() -> f32 {
@@ -286,8 +363,41 @@ impl Default for Settings {
             debug_logging: false,
             custom_vocabulary: String::new(),
             copy_to_clipboard: false,
+            cleanup_level: default_cleanup_level(),
+            numbers_as_digits: false,
+            number_symbols: false,
+            spoken_emoji: false,
+            replacements: Vec::new(),
+            snippets: Vec::new(),
+            escape_cancels: true,
+            hands_free_hotkey: String::new(),
+            paste_last_hotkey: String::new(),
+            mouse_button: String::new(),
+            overlay_style: default_overlay_style(),
+            overlay_position: default_overlay_position(),
+            ready_pill: true,
+            skip_silence: true,
+            mute_other_audio: false,
+            history_retention_days: default_history_retention_days(),
+            history_keep_audio: true,
         }
     }
+}
+
+/// How the running session was started, so only the matching release or
+/// shortcut ends it (a hands-free take is not stopped by a stray hotkey tap).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Trigger {
+    /// Push-to-talk hold of the main hotkey.
+    #[default]
+    Hold,
+    /// Main hotkey in toggle mode.
+    Toggle,
+    HandsFree,
+    /// Mouse button; held or toggled like the hotkey.
+    Mouse,
+    /// Tray menu or the VocaWin window.
+    Manual,
 }
 
 /// WASAPI `cpal::Stream` is intentionally `!Send`/`!Sync` across platforms.
@@ -846,50 +956,124 @@ fn apply_ready_or_parked_tray(app: &AppHandle) {
     );
 }
 
+/// Silence or the max-recording limit ended the take on the audio thread.
 #[cfg(windows)]
 fn finish_captured_audio(app: &AppHandle, samples: Vec<f32>, sample_rate: u32) {
     let state = app.state::<AppState>();
-    {
-        let mut flag = state.recording.lock().unwrap_or_else(|e| e.into_inner());
-        *flag = false;
-    }
+    set_recording_flag(&state, false);
     let _ = app.emit("recording-changed", false);
-    set_tray_phase(app, TrayPhase::Processing);
     let sound = state
         .settings
         .lock()
         .map(|settings| settings.sound_theme.clone())
         .unwrap_or_else(|_| "voca".into());
     sounds::play_if_enabled(&sound, false);
-    match transcribe_samples(&state, samples, sample_rate) {
-        Ok(text) if !text.is_empty() => {
-            let inject = *state
-                .inject_on_auto_stop
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if inject {
-                let _ = inject_transcript(&*state, &text);
-                let _ = app.emit("dictation-finished", text);
+    let inject = session_injects(&state);
+    match complete_take(app, samples, sample_rate, true) {
+        Ok(text) => {
+            let event = if inject {
+                "dictation-finished"
             } else {
-                let _ = app.emit("test-dictation-finished", text);
-            }
-        }
-        Ok(_) => {
-            let inject = *state
-                .inject_on_auto_stop
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if inject {
-                let _ = app.emit("dictation-finished", String::new());
-            } else {
-                let _ = app.emit("test-dictation-finished", String::new());
-            }
+                "test-dictation-finished"
+            };
+            let _ = app.emit(event, text);
         }
         Err(error) => {
             sounds::play_error_if_enabled(&sound);
             logbuf::error_and_emit(app, format!("Dictation error: {error}"));
             let _ = app.emit("dictation-error", error);
         }
+    }
+}
+
+fn session_injects(state: &AppState) -> bool {
+    *state
+        .inject_on_auto_stop
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn overlay_on(settings: &Settings) -> bool {
+    settings.overlay_style != "off"
+}
+
+/// Everything after the microphone closed: ducking, the pill, transcription,
+/// the cancel check, typing, and stats. With `type_it` false the text is
+/// handed back instead (the VocaWin window types it itself).
+fn complete_take(
+    app: &AppHandle,
+    samples: Vec<f32>,
+    sample_rate: u32,
+    type_it: bool,
+) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
+    let inject = session_injects(&state);
+    state.ducker.restore();
+    state.processing.store(true, Ordering::SeqCst);
+    set_tray_phase(app, TrayPhase::Processing);
+    if inject {
+        overlay::show(app, overlay::Phase::Processing, overlay_on(&settings));
+    }
+    let generation = state.session_generation.load(Ordering::SeqCst);
+    let result = transcribe_samples(&state, samples, sample_rate);
+    state.processing.store(false, Ordering::SeqCst);
+    let recording_again = *state.recording.lock().unwrap_or_else(|e| e.into_inner());
+    if !recording_again {
+        hook::set_cancel_armed(false);
+    }
+    let cancelled = state.cancel_generation.load(Ordering::SeqCst) != generation;
+    let outcome = match result {
+        Ok(take) if cancelled => {
+            if let Some(id) = take.history_id {
+                let _ = state.history.set_status(id, history::STATUS_CANCELLED);
+            }
+            logbuf::info_and_emit(app, "Cancelled take was not typed.");
+            Ok(String::new())
+        }
+        Ok(take) => {
+            let mut delivered = Ok(take.text.clone());
+            if inject && !take.text.is_empty() {
+                if let Ok(mut last) = state.last_dictation.lock() {
+                    *last = take.text.clone();
+                }
+                if let Err(error) = stats::record(&state.stats_path, &take.text, take.speech_ms) {
+                    logbuf::warn(error);
+                }
+                if type_it {
+                    if let Err(error) = inject_transcript(&state, &take.text) {
+                        delivered = Err(format!("Could not type the text: {error}"));
+                    }
+                }
+            }
+            match &delivered {
+                Err(error) if inject => {
+                    overlay::show(app, overlay::Phase::Error(error.clone()), overlay_on(&settings))
+                }
+                _ if inject && !recording_again => overlay::hide(app),
+                _ => {}
+            }
+            delivered
+        }
+        Err(error) => {
+            if inject {
+                overlay::show(app, overlay::Phase::Error(error.clone()), overlay_on(&settings));
+            }
+            Err(error)
+        }
+    };
+    let _ = app.emit("history-changed", ());
+    apply_ready_or_parked_tray(app);
+    outcome
+}
+
+/// The session ended without audio to transcribe: put the chrome back.
+fn release_session_chrome(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    state.ducker.restore();
+    hook::set_cancel_armed(false);
+    if session_injects(&state) {
+        overlay::hide(app);
     }
     apply_ready_or_parked_tray(app);
 }
@@ -906,19 +1090,11 @@ struct ModelInstallStatus {
     bytes_on_disk: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HistoryEntry {
-    id: u128,
-    text: String,
-    model_id: String,
-    created_at_ms: u128,
-}
-
 struct AppState {
     settings: Mutex<Settings>,
     settings_path: PathBuf,
-    history_path: PathBuf,
+    history: history::HistoryStore,
+    stats_path: PathBuf,
     models_path: PathBuf,
     downloads: Mutex<HashMap<String, ModelInstallStatus>>,
     recorder: AudioRecorder,
@@ -934,6 +1110,16 @@ struct AppState {
     /// Last poll of Whisper residency, used to spot idle unload.
     saw_model_loaded: Mutex<bool>,
     whisper_cache: whisper_cache::WhisperCache,
+    /// How the running (or last) session started.
+    session_trigger: Mutex<Trigger>,
+    /// True while a finished take is being transcribed.
+    processing: AtomicBool,
+    /// Bumped by Escape; a take started before the bump is not typed.
+    cancel_generation: AtomicU64,
+    session_generation: AtomicU64,
+    /// For paste-last; kept even when history is off.
+    last_dictation: Mutex<String>,
+    ducker: ducking::Ducker,
 }
 
 /// A malformed or partially-written settings file must never prevent dictation
@@ -944,42 +1130,6 @@ fn load_settings(path: &std::path::Path) -> Settings {
     let mut settings: Settings = serde_json::from_str(&contents).unwrap_or_default();
     sounds::apply_theme(&mut settings.sound_theme, &mut settings.sound_effects);
     settings
-}
-
-fn load_history(path: &Path) -> Vec<HistoryEntry> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| serde_json::from_str(&contents).ok())
-        .unwrap_or_default()
-}
-
-fn append_history(path: &Path, text: String, model_id: String) -> Result<(), String> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| format!("Could not timestamp transcription: {error}"))?
-        .as_millis();
-    let mut entries = load_history(path);
-    entries.insert(
-        0,
-        HistoryEntry {
-            id: now,
-            text,
-            model_id,
-            created_at_ms: now,
-        },
-    );
-    entries.truncate(100);
-    let parent = path
-        .parent()
-        .ok_or("History path has no parent directory")?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("Could not create history directory: {error}"))?;
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(&entries)
-            .map_err(|error| format!("Could not save history: {error}"))?,
-    )
-    .map_err(|error| format!("Could not save history: {error}"))
 }
 
 fn persist_settings(path: &std::path::Path, settings: &Settings) -> Result<(), String> {
@@ -1041,6 +1191,7 @@ fn save_settings(
     }
     sounds::apply_theme(&mut settings.sound_theme, &mut settings.sound_effects);
     settings.hotkey = hotkey::canonicalize(&settings.hotkey)?;
+    normalize_extra_settings(&mut settings)?;
     let previous_launch = state
         .settings
         .lock()
@@ -1076,6 +1227,13 @@ fn save_settings(
         }
     }
     logbuf::set_debug_enabled(settings.debug_logging);
+    apply_extra_shortcuts(&settings);
+    if let Err(error) = state.history.prune(settings.history_retention_days) {
+        logbuf::warn(error);
+    }
+    if !overlay_on(&settings) {
+        overlay::hide(&app);
+    }
     logbuf::debug(format!(
         "Settings saved (model {}, hotkey {}, debug={})",
         settings.selected_model, settings.hotkey, settings.debug_logging
@@ -1097,6 +1255,62 @@ fn save_settings(
         let _ = app.emit("settings-changed", settings);
         return Err(error);
     }
+    Ok(())
+}
+
+/// Longest dictionary or snippet list kept.
+const MAX_DICTIONARY_ENTRIES: usize = 500;
+
+/// Checks and tidies the settings added for VocaMac parity: shortcuts,
+/// overlay, history retention, text rules, dictionary, and snippets.
+fn normalize_extra_settings(settings: &mut Settings) -> Result<(), String> {
+    if !matches!(settings.cleanup_level.as_str(), "none" | "medium") {
+        return Err("Cleanup must be none or medium".into());
+    }
+    if !matches!(settings.overlay_style.as_str(), "minimal" | "off") {
+        return Err("Recording overlay must be minimal or off".into());
+    }
+    if !matches!(settings.overlay_position.as_str(), "bottom" | "top") {
+        return Err("Overlay position must be bottom or top".into());
+    }
+    if !matches!(settings.mouse_button.as_str(), "" | "middle" | "x1" | "x2") {
+        return Err("Mouse button must be middle, x1, x2, or none".into());
+    }
+    if !matches!(settings.history_retention_days, 0 | 1 | 7 | 30) {
+        return Err("Keep history for 1, 7, or 30 days, or forever".into());
+    }
+    settings.hands_free_hotkey = validate_extra_shortcut(
+        &settings.hands_free_hotkey,
+        "Hands-free shortcut",
+        &[&settings.hotkey],
+    )?;
+    settings.paste_last_hotkey = validate_extra_shortcut(
+        &settings.paste_last_hotkey,
+        "Paste-last shortcut",
+        &[&settings.hotkey, &settings.hands_free_hotkey],
+    )?;
+    let mut replacements: Vec<dictionary::Replacement> = settings
+        .replacements
+        .iter()
+        .map(|entry| dictionary::Replacement {
+            heard: entry.heard.trim().to_string(),
+            replacement: entry.replacement.trim().to_string(),
+        })
+        .filter(|entry| !entry.heard.is_empty() && !entry.replacement.is_empty())
+        .collect();
+    replacements.truncate(MAX_DICTIONARY_ENTRIES);
+    settings.replacements = replacements;
+    let mut snippets: Vec<dictionary::Snippet> = settings
+        .snippets
+        .iter()
+        .map(|entry| dictionary::Snippet {
+            trigger: entry.trigger.trim().to_string(),
+            expansion: entry.expansion.clone(),
+        })
+        .filter(|entry| !entry.trigger.is_empty() && !entry.expansion.trim().is_empty())
+        .collect();
+    snippets.truncate(MAX_DICTIONARY_ENTRIES);
+    settings.snippets = snippets;
     Ok(())
 }
 
@@ -1159,17 +1373,162 @@ fn fallback_selected_model_if_needed(settings: &mut Settings, models_path: &Path
 }
 
 #[tauri::command]
-fn get_history(state: State<'_, AppState>) -> Vec<HistoryEntry> {
-    load_history(&state.history_path)
+fn get_history(state: State<'_, AppState>) -> Vec<history::HistoryEntry> {
+    state.history.load()
 }
 
 #[tauri::command]
 fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
-    if state.history_path.exists() {
-        fs::remove_file(&state.history_path)
-            .map_err(|error| format!("Could not clear history: {error}"))?;
+    sounds::stop_file();
+    state.history.clear()
+}
+
+#[tauri::command]
+fn delete_history_entry(id: u64, state: State<'_, AppState>) -> Result<(), String> {
+    sounds::stop_file();
+    state.history.delete(id as u128)
+}
+
+/// Transcribe a saved take again with the current model and settings. The
+/// entry's text is replaced; nothing is typed.
+#[tauri::command]
+async fn retry_history_entry(id: u64, app: AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let id = id as u128;
+        let path = state
+            .history
+            .audio_path(id)
+            .ok_or("This take has no saved audio to retry.")?;
+        let pcm = history::read_wav(&path)?;
+        let settings = state
+            .settings
+            .lock()
+            .map_err(|_| "Settings lock was poisoned")?
+            .clone();
+        if !model_is_installed(&state.models_path, &settings.selected_model) {
+            return Err("Install the selected speech model before retrying.".into());
+        }
+        logbuf::debug_and_emit(&app, format!("Retry history take with {}", settings.selected_model));
+        let result = recognize_and_format(&state, &settings, &pcm);
+        match &result {
+            Ok(text) if !text.trim().is_empty() => state.history.finish(
+                id,
+                text,
+                &settings.selected_model,
+                history::STATUS_OK,
+                None,
+            )?,
+            Ok(_) => state.history.finish(
+                id,
+                "",
+                &settings.selected_model,
+                history::STATUS_FAILED,
+                Some("No speech was recognized.".into()),
+            )?,
+            Err(error) => state.history.finish(
+                id,
+                "",
+                &settings.selected_model,
+                history::STATUS_FAILED,
+                Some(error.clone()),
+            )?,
+        }
+        result
+    })
+    .await
+    .map_err(|error| format!("Retry was cancelled: {error}"))?
+}
+
+#[tauri::command]
+fn play_history_audio(id: u64, state: State<'_, AppState>) -> Result<(), String> {
+    let path = state
+        .history
+        .audio_path(id as u128)
+        .ok_or("This take has no saved audio.")?;
+    sounds::play_file(&path)
+}
+
+#[tauri::command]
+fn stop_history_audio() {
+    sounds::stop_file();
+}
+
+#[tauri::command]
+fn get_stats(state: State<'_, AppState>) -> stats::Summary {
+    stats::summary(&state.stats_path)
+}
+
+#[tauri::command]
+fn reset_stats(state: State<'_, AppState>) -> Result<(), String> {
+    stats::reset(&state.stats_path)
+}
+
+/// Run text through the same rules a dictation gets, for the Try box.
+#[tauri::command]
+fn preview_text(text: String, state: State<'_, AppState>) -> Result<String, String> {
+    let settings = state
+        .settings
+        .lock()
+        .map_err(|_| "Settings lock was poisoned")?
+        .clone();
+    Ok(format_transcript(&settings, &text))
+}
+
+/// Settings backup: a JSON file in Downloads. There are no secrets in it.
+#[tauri::command]
+fn export_settings(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    let settings = state
+        .settings
+        .lock()
+        .map_err(|_| "Settings lock was poisoned")?
+        .clone();
+    let folder = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().document_dir())
+        .map_err(|error| format!("Could not find the Downloads folder: {error}"))?;
+    fs::create_dir_all(&folder)
+        .map_err(|error| format!("Could not open the Downloads folder: {error}"))?;
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let path = folder.join(format!("vocawin-settings-{stamp}.json"));
+    let mut value = serde_json::to_value(&settings)
+        .map_err(|error| format!("Could not export settings: {error}"))?;
+    if let Some(object) = value.as_object_mut() {
+        // First-run state belongs to this PC, not to the backup.
+        object.remove("welcomeDismissed");
+        object.insert("vocawinSettingsVersion".into(), 1.into());
     }
-    Ok(())
+    let serialized = serde_json::to_vec_pretty(&value)
+        .map_err(|error| format!("Could not export settings: {error}"))?;
+    fs::write(&path, serialized).map_err(|error| format!("Could not export settings: {error}"))?;
+    Ok(path.display().to_string())
+}
+
+/// Parse a backup from `export_settings` into full settings for this PC. The
+/// caller saves them, so every value goes through `save_settings` checks.
+#[tauri::command]
+fn parse_settings_backup(contents: String, state: State<'_, AppState>) -> Result<Settings, String> {
+    let mut value: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|_| "That file is not a VocaWin settings backup.".to_string())?;
+    let object = value
+        .as_object_mut()
+        .filter(|object| object.contains_key("vocawinSettingsVersion"))
+        .ok_or("That file is not a VocaWin settings backup.")?;
+    object.remove("vocawinSettingsVersion");
+    let current = state
+        .settings
+        .lock()
+        .map_err(|_| "Settings lock was poisoned")?
+        .clone();
+    let mut imported: Settings = serde_json::from_value(value)
+        .map_err(|error| format!("Could not read the backup: {error}"))?;
+    imported.welcome_dismissed = current.welcome_dismissed;
+    // A model that is not on this PC would leave dictation with nothing to run.
+    if !model_is_installed(&state.models_path, &imported.selected_model) {
+        imported.selected_model = current.selected_model;
+    }
+    Ok(imported)
 }
 
 #[tauri::command]
@@ -1862,7 +2221,7 @@ fn clear_recording_after_capture_drop(app: &AppHandle) {
         state.release_during_open.store(false, Ordering::SeqCst);
     }
     let _ = app.emit("recording-changed", false);
-    apply_ready_or_parked_tray(app);
+    release_session_chrome(app);
 }
 
 fn session_is_live(_recording_flag: bool, capture_live: bool) -> bool {
@@ -1879,8 +2238,14 @@ fn set_recording_flag(state: &AppState, value: bool) {
 
 /// Begins microphone capture. The session flag is true only after WASAPI
 /// actually opens. `inject` is false for Test Dictation so silence/max
-/// auto-stop will not type into the front app.
-fn begin_voice_session(app: &AppHandle, inject: bool) -> Result<(), String> {
+/// auto-stop will not type into the front app. `silence_auto_stop` is on for
+/// toggled takes; a held key or the hands-free shortcut ends the others.
+fn begin_voice_session(
+    app: &AppHandle,
+    inject: bool,
+    trigger: Trigger,
+    silence_auto_stop: bool,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
     if *state
         .dictation_paused
@@ -1901,6 +2266,10 @@ fn begin_voice_session(app: &AppHandle, inject: bool) -> Result<(), String> {
         .inject_on_auto_stop
         .lock()
         .map_err(|_| "Inject lock was poisoned")? = inject;
+    *state
+        .session_trigger
+        .lock()
+        .map_err(|_| "Session lock was poisoned")? = trigger;
     let settings = state
         .settings
         .lock()
@@ -1930,20 +2299,33 @@ fn begin_voice_session(app: &AppHandle, inject: bool) -> Result<(), String> {
     }
     state.session_opening.store(true, Ordering::SeqCst);
     state.release_during_open.store(false, Ordering::SeqCst);
+    state.session_generation.store(
+        state.cancel_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
     if let Err(error) = state.recorder.start(
         settings.silence_seconds,
         settings.max_recording_seconds,
         settings.input_device.clone(),
-        settings.activation_mode == "toggle",
+        silence_auto_stop,
     ) {
         state.session_opening.store(false, Ordering::SeqCst);
         set_recording_flag(&state, recording_after_start_attempt(false));
         let _ = app.emit("recording-changed", false);
         logbuf::error_and_emit(app, format!("Start dictation failed: {error}"));
+        if inject {
+            overlay::show(app, overlay::Phase::Error(error.clone()), overlay_on(&settings));
+        }
         return Err(error);
     }
     set_recording_flag(&state, recording_after_start_attempt(true));
     state.session_opening.store(false, Ordering::SeqCst);
+    if settings.escape_cancels {
+        hook::set_cancel_armed(true);
+    }
+    if settings.mute_other_audio {
+        state.ducker.mute_others();
+    }
     if state.release_during_open.swap(false, Ordering::SeqCst) {
         finish_voice_session(app);
         return Ok(());
@@ -1951,6 +2333,14 @@ fn begin_voice_session(app: &AppHandle, inject: bool) -> Result<(), String> {
     sounds::play_if_enabled(&settings.sound_theme, true);
     let _ = app.emit("recording-changed", true);
     set_tray_phase(app, TrayPhase::Listening);
+    if inject {
+        let hint = if settings.escape_cancels {
+            "Esc to cancel".to_string()
+        } else {
+            String::new()
+        };
+        overlay::show(app, overlay::Phase::Listening { hint }, overlay_on(&settings));
+    }
     Ok(())
 }
 
@@ -1960,16 +2350,79 @@ fn begin_voice_session(app: &AppHandle, inject: bool) -> Result<(), String> {
 #[tauri::command]
 async fn start_recording(app: AppHandle, no_inject: Option<bool>) -> Result<(), String> {
     let inject = !no_inject.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || begin_voice_session(&app, inject))
-        .await
-        .map_err(|error| format!("Start dictation was cancelled: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let toggle = manual_silence_auto_stop(&app);
+        begin_voice_session(&app, inject, Trigger::Manual, toggle)
+    })
+    .await
+    .map_err(|error| format!("Start dictation was cancelled: {error}"))?
 }
 
-fn transcribe_samples(
-    state: &AppState,
-    samples: Vec<f32>,
-    sample_rate: u32,
-) -> Result<String, String> {
+/// Takes started from the tray or window follow the activation style.
+fn manual_silence_auto_stop(app: &AppHandle) -> bool {
+    app.state::<AppState>()
+        .settings
+        .lock()
+        .map(|settings| settings.activation_mode == "toggle")
+        .unwrap_or(false)
+}
+
+fn language_code(language: &str) -> Option<&'static str> {
+    Some(match language {
+        "English" => "en",
+        "Spanish" => "es",
+        "French" => "fr",
+        "German" => "de",
+        "Italian" => "it",
+        "Portuguese" => "pt",
+        "Dutch" => "nl",
+        "Russian" => "ru",
+        "Japanese" => "ja",
+        "Chinese" => "zh",
+        "Korean" => "ko",
+        "Arabic" => "ar",
+        "Hindi" => "hi",
+        "Turkish" => "tr",
+        "Polish" => "pl",
+        "Ukrainian" => "uk",
+        "Swedish" => "sv",
+        "Norwegian" => "no",
+        "Danish" => "da",
+        "Finnish" => "fi",
+        "Czech" => "cs",
+        "Greek" => "el",
+        "Hebrew" => "he",
+        "Indonesian" => "id",
+        "Vietnamese" => "vi",
+        "Thai" => "th",
+        "Romanian" => "ro",
+        "Hungarian" => "hu",
+        "Catalan" => "ca",
+        _ => return None,
+    })
+}
+
+/// The language the text rules may assume: the chosen one, or English for
+/// an English-only model. `None` lets them judge the text.
+fn text_language(settings: &Settings) -> Option<&'static str> {
+    language_code(&settings.language).or_else(|| {
+        model_catalog()
+            .iter()
+            .find(|model| model.id == settings.selected_model)
+            .filter(|model| model.languages == "English")
+            .map(|_| "en")
+    })
+}
+
+/// A finished take: the text to type, its history entry, and how long the
+/// speech was.
+struct Take {
+    text: String,
+    history_id: Option<u128>,
+    speech_ms: u64,
+}
+
+fn transcribe_samples(state: &AppState, samples: Vec<f32>, sample_rate: u32) -> Result<Take, String> {
     let settings = state
         .settings
         .lock()
@@ -1987,82 +2440,76 @@ fn transcribe_samples(
         logbuf::warn("Recording is too short.");
         return Err("Recording is too short. Hold the hotkey and speak for a moment.".into());
     }
-    let language_code = match settings.language.as_str() {
-        "English" => Some("en"),
-        "Spanish" => Some("es"),
-        "French" => Some("fr"),
-        "German" => Some("de"),
-        "Italian" => Some("it"),
-        "Portuguese" => Some("pt"),
-        "Dutch" => Some("nl"),
-        "Russian" => Some("ru"),
-        "Japanese" => Some("ja"),
-        "Chinese" => Some("zh"),
-        "Korean" => Some("ko"),
-        "Arabic" => Some("ar"),
-        "Hindi" => Some("hi"),
-        "Turkish" => Some("tr"),
-        "Polish" => Some("pl"),
-        "Ukrainian" => Some("uk"),
-        "Swedish" => Some("sv"),
-        "Norwegian" => Some("no"),
-        "Danish" => Some("da"),
-        "Finnish" => Some("fi"),
-        "Czech" => Some("cs"),
-        "Greek" => Some("el"),
-        "Hebrew" => Some("he"),
-        "Indonesian" => Some("id"),
-        "Vietnamese" => Some("vi"),
-        "Thai" => Some("th"),
-        "Romanian" => Some("ro"),
-        "Hungarian" => Some("hu"),
-        "Catalan" => Some("ca"),
-        _ => None,
-    };
-    let raw = if !settings.selected_model.starts_with("whisper-")
-        && !settings.selected_model.starts_with("distil-whisper-")
-    {
-        transcribe_onnx(
-            &settings.selected_model,
-            &state.models_path,
-            &pcm,
-            language_code,
-        )?
-    } else {
-        let model_path = state
-            .models_path
-            .join(format!("{}.bin", settings.selected_model));
-        if !model_path.exists() {
-            return Err(format!(
-                "Model is not installed: {}. Put its whisper.cpp GGML .bin file at {}.",
-                settings.selected_model,
-                model_path.display()
-            ));
+    let speech_ms = pcm.len() as u64 * 1000 / 16_000;
+    // The audio is on disk before the model runs, so a crash or a failed
+    // decode never loses what was said.
+    let history_id = if settings.history_enabled {
+        match state
+            .history
+            .begin(&pcm, &settings.selected_model, settings.history_keep_audio)
+        {
+            Ok(id) => Some(id),
+            Err(error) => {
+                logbuf::warn(error);
+                None
+            }
         }
-        let gpu = gpu::detect_gpu();
-        let use_gpu = cfg!(vocawin_whisper_vulkan) && gpu.available;
-        state.whisper_cache.transcribe(
-            model_path,
-            pcm,
-            language_code.map(str::to_string),
-            use_gpu,
-            gpu.device_index,
-            true,
-            vocabulary::whisper_prompt(&settings.custom_vocabulary),
-        )?
+    } else {
+        None
     };
-    let text = output::apply_output_polish(
-        &raw,
-        settings.auto_capitalize,
-        settings.append_trailing_space,
-    );
-    if !text.trim().is_empty() && settings.history_enabled {
-        append_history(
-            &state.history_path,
-            text.trim().to_string(),
-            settings.selected_model.clone(),
-        )?;
+    let result = recognize_and_format(state, &settings, &pcm);
+    if let Some(id) = history_id {
+        let saved = match &result {
+            Ok(text) => state.history.finish(
+                id,
+                text,
+                &settings.selected_model,
+                history::STATUS_OK,
+                None,
+            ),
+            Err(error) => state.history.finish(
+                id,
+                "",
+                &settings.selected_model,
+                history::STATUS_FAILED,
+                Some(error.clone()),
+            ),
+        };
+        if let Err(error) = saved {
+            logbuf::warn(error);
+        }
     }
+    result.map(|text| Take {
+        text,
+        history_id,
+        speech_ms,
+    })
+}
+
+/// Silence trim, the model, then the text rules.
+fn recognize_and_format(state: &AppState, settings: &Settings, pcm: &[f32]) -> Result<String, String> {
+    let audio = if settings.skip_silence {
+        match silence::decide(pcm) {
+            silence::Decision::NoSpeech => {
+                logbuf::debug("No speech in the recording; skipped the model.");
+                return Ok(String::new());
+            }
+            silence::Decision::Trim(ranges) => {
+                let trimmed = silence::apply(&ranges, pcm);
+                logbuf::debug(format!(
+                    "Skipped silence: {} of {} samples go to the model.",
+                    trimmed.len(),
+                    pcm.len()
+                ));
+                trimmed
+            }
+            silence::Decision::Keep => pcm.to_vec(),
+        }
+    } else {
+        pcm.to_vec()
+    };
+    let raw = recognize(state, settings, audio)?;
+    let text = format_transcript(settings, &raw);
     logbuf::info(format!(
         "Transcribed {} chars with {}",
         text.chars().count(),
@@ -2071,47 +2518,108 @@ fn transcribe_samples(
     Ok(text)
 }
 
-/// Stop capture and clear the session flag even when stop() fails.
-/// Transcribe only when there is real PCM.
-fn end_voice_session(state: &AppState) -> Result<Option<String>, String> {
+fn recognize(state: &AppState, settings: &Settings, pcm: Vec<f32>) -> Result<String, String> {
+    let language = language_code(&settings.language);
+    if !settings.selected_model.starts_with("whisper-")
+        && !settings.selected_model.starts_with("distil-whisper-")
+    {
+        return transcribe_onnx(&settings.selected_model, &state.models_path, &pcm, language);
+    }
+    let model_path = state
+        .models_path
+        .join(format!("{}.bin", settings.selected_model));
+    if !model_path.exists() {
+        return Err(format!(
+            "Model is not installed: {}. Put its whisper.cpp GGML .bin file at {}.",
+            settings.selected_model,
+            model_path.display()
+        ));
+    }
+    let gpu = gpu::detect_gpu();
+    let use_gpu = cfg!(vocawin_whisper_vulkan) && gpu.available;
+    state.whisper_cache.transcribe(
+        model_path,
+        pcm,
+        language.map(str::to_string),
+        use_gpu,
+        gpu.device_index,
+        true,
+        vocabulary::whisper_prompt(&settings.custom_vocabulary),
+    )
+}
+
+/// The text rules every take gets (see `pipeline`).
+fn format_transcript(settings: &Settings, raw: &str) -> String {
+    let vocabulary = vocabulary::terms(&settings.custom_vocabulary);
+    pipeline::process(
+        raw,
+        &pipeline::TextOptions {
+            language: text_language(settings),
+            cleanup: settings.cleanup_level != "none",
+            vocabulary: &vocabulary,
+            replacements: &settings.replacements,
+            snippets: &settings.snippets,
+            numbers: settings.numbers_as_digits,
+            symbols: settings.numbers_as_digits && settings.number_symbols,
+            emoji: settings.spoken_emoji,
+            auto_capitalize: settings.auto_capitalize,
+            trailing_space: settings.append_trailing_space,
+        },
+    )
+}
+
+/// Stop capture and clear the session flag even when stop() fails. Returns
+/// the audio when there is any.
+fn stop_capture(state: &AppState) -> Result<Option<(Vec<f32>, u32)>, String> {
     let stopped = state.recorder.stop();
     set_recording_flag(state, recording_after_stop_attempt());
     state.session_opening.store(false, Ordering::SeqCst);
     state.release_during_open.store(false, Ordering::SeqCst);
     match stopped {
-        Ok((samples, sample_rate)) if !samples.is_empty() => {
-            transcribe_samples(state, samples, sample_rate).map(Some)
-        }
+        Ok((samples, sample_rate)) if !samples.is_empty() => Ok(Some((samples, sample_rate))),
         Ok(_) => Ok(None),
         Err(error) if is_stale_stop_error(&error) => Ok(None),
         Err(error) => Err(error),
     }
 }
 
+/// Stop and discard: auto-pause and Escape.
 fn abandon_voice_session(state: &AppState) {
     let _ = state.recorder.stop();
     set_recording_flag(state, recording_after_stop_attempt());
     state.session_opening.store(false, Ordering::SeqCst);
     state.release_during_open.store(false, Ordering::SeqCst);
+    state.ducker.restore();
 }
 
 fn finish_voice_session(handle: &AppHandle) {
     let state = handle.state::<AppState>();
     let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
-    set_tray_phase(handle, TrayPhase::Processing);
-    let inject = *state
-        .inject_on_auto_stop
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match end_voice_session(&state) {
-        Ok(Some(text)) if !text.is_empty() => {
+    let inject = session_injects(&state);
+    let captured = stop_capture(&state);
+    let _ = handle.emit("recording-changed", false);
+    let result = match captured {
+        Ok(Some((samples, sample_rate))) => {
             sounds::play_if_enabled(&settings.sound_theme, false);
-            if inject {
-                let _ = inject_transcript(&*state, &text);
-                let _ = handle.emit("dictation-finished", text);
+            complete_take(handle, samples, sample_rate, true)
+        }
+        Ok(None) => {
+            release_session_chrome(handle);
+            return;
+        }
+        Err(error) => {
+            release_session_chrome(handle);
+            Err(error)
+        }
+    };
+    match result {
+        Ok(text) if !text.is_empty() => {
+            let event = if inject {
+                "dictation-finished"
             } else {
-                let _ = handle.emit("test-dictation-finished", text);
-            }
+                "test-dictation-finished"
+            };
+            let _ = handle.emit(event, text);
         }
         Ok(_) => {}
         Err(error) => {
@@ -2120,8 +2628,6 @@ fn finish_voice_session(handle: &AppHandle) {
             let _ = handle.emit("dictation-error", error);
         }
     }
-    let _ = handle.emit("recording-changed", false);
-    apply_ready_or_parked_tray(handle);
 }
 
 #[tauri::command]
@@ -2133,24 +2639,137 @@ async fn stop_and_transcribe(app: AppHandle) -> Result<String, String> {
             .lock()
             .map(|settings| settings.sound_theme.clone())
             .unwrap_or_else(|_| "voca".into());
-        set_tray_phase(&app, TrayPhase::Processing);
-        let text = match end_voice_session(&state) {
-            Ok(Some(text)) => text,
-            Ok(None) => String::new(),
+        let captured = stop_capture(&state);
+        let _ = app.emit("recording-changed", false);
+        let result = match captured {
+            Ok(Some((samples, sample_rate))) => {
+                sounds::play_if_enabled(&sound, false);
+                complete_take(&app, samples, sample_rate, false)
+            }
+            Ok(None) => {
+                release_session_chrome(&app);
+                Ok(String::new())
+            }
             Err(error) => {
-                let _ = app.emit("recording-changed", false);
-                apply_ready_or_parked_tray(&app);
-                sounds::play_error_if_enabled(&sound);
-                return Err(error);
+                release_session_chrome(&app);
+                Err(error)
             }
         };
-        sounds::play_if_enabled(&sound, false);
-        let _ = app.emit("recording-changed", false);
-        apply_ready_or_parked_tray(&app);
-        Ok(text)
+        if result.is_err() {
+            sounds::play_error_if_enabled(&sound);
+        }
+        result
     })
     .await
     .map_err(|error| format!("Stop dictation was cancelled: {error}"))?
+}
+
+/// Escape: throw the take away. While recording the audio is discarded;
+/// while transcribing, the result is kept in History but not typed.
+fn cancel_voice_session(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    state.cancel_generation.fetch_add(1, Ordering::SeqCst);
+    hook::set_cancel_armed(false);
+    let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
+    let recording = *state.recording.lock().unwrap_or_else(|e| e.into_inner())
+        || state.session_opening.load(Ordering::SeqCst)
+        || state.recorder.capture_live();
+    if recording {
+        abandon_voice_session(&state);
+        let _ = app.emit("recording-changed", false);
+        logbuf::info_and_emit(app, "Dictation cancelled.");
+        apply_ready_or_parked_tray(app);
+    } else if state.processing.load(Ordering::SeqCst) {
+        logbuf::info_and_emit(app, "Transcription cancelled; nothing will be typed.");
+    } else {
+        return;
+    }
+    overlay::show(app, overlay::Phase::Cancelled, overlay_on(&settings));
+    let _ = app.emit("dictation-cancelled", ());
+}
+
+/// Type the last dictation again. Waits for the shortcut's modifiers to come
+/// up first, or Ctrl+Alt would turn the text into shortcuts.
+fn paste_last(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
+    let remembered = state
+        .last_dictation
+        .lock()
+        .map(|last| last.clone())
+        .unwrap_or_default();
+    let text = if remembered.trim().is_empty() {
+        state
+            .history
+            .latest_text()
+            .map(|text| {
+                if settings.append_trailing_space {
+                    output::append_trailing_space(&text)
+                } else {
+                    text
+                }
+            })
+            .unwrap_or_default()
+    } else {
+        remembered
+    };
+    if text.trim().is_empty() {
+        overlay::show(
+            app,
+            overlay::Phase::Notice("Nothing to paste yet".into()),
+            overlay_on(&settings),
+        );
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        output::wait_for_modifiers_released(std::time::Duration::from_millis(1_500));
+        let state = app.state::<AppState>();
+        if let Err(error) = inject_transcript(&state, &text) {
+            overlay::show(&app, overlay::Phase::Error(error), overlay_on(&settings));
+        }
+    });
+}
+
+/// The pill shown for a few seconds after launch, so people can tell VocaWin
+/// started even when its tray icon is tucked into the overflow.
+fn show_ready_pill(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
+    if !settings.ready_pill {
+        return;
+    }
+    let paused = *state
+        .dictation_paused
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (title, detail) = if !model_is_installed(&state.models_path, &settings.selected_model) {
+        (
+            "VocaWin is running".to_string(),
+            "Download a speech model to start dictating".to_string(),
+        )
+    } else if paused {
+        (
+            "VocaWin is paused".to_string(),
+            "A watched app is running".to_string(),
+        )
+    } else {
+        let key = hotkey_display(&settings.hotkey);
+        let action = if settings.activation_mode == "toggle" {
+            format!("Tap {key} to dictate")
+        } else {
+            format!("Hold {key} to dictate")
+        };
+        ("VocaWin is ready".to_string(), action)
+    };
+    overlay::show(app, overlay::Phase::Ready { title, detail }, true);
+}
+
+/// "Right Alt" rather than the preset label's "(Option)" or "Custom:".
+fn hotkey_display(spec: &str) -> String {
+    let name = hotkey::display_name(spec);
+    let name = name.strip_prefix("Custom: ").unwrap_or(&name);
+    name.replace(" (Option)", "")
 }
 
 #[tauri::command]
@@ -2412,6 +3031,22 @@ fn inject_text(text: String, state: State<'_, AppState>) -> Result<(), String> {
     inject_transcript(&*state, &text)
 }
 
+/// What the overlay page should show when it (re)loads.
+#[tauri::command]
+fn get_overlay_phase() -> overlay::Payload {
+    overlay::current()
+}
+
+#[tauri::command]
+fn set_overlay_width(width: f64, app: AppHandle) {
+    overlay::set_width(&app, width);
+}
+
+#[tauri::command]
+fn dismiss_overlay(app: AppHandle) {
+    overlay::dismiss(&app);
+}
+
 #[tauri::command]
 fn copy_text(text: String) -> Result<(), String> {
     output::copy_to_clipboard(&text)
@@ -2482,7 +3117,11 @@ pub fn run() {
         .setup(move |app| {
             let app_data = app.path().app_data_dir()?;
             let settings_path = app_data.join("settings.json");
-            let history_path = app_data.join("history.json");
+            let history = history::HistoryStore::new(
+                app_data.join("history.json"),
+                app_data.join("history-audio"),
+            );
+            let stats_path = app_data.join("stats.json");
             let models_path = app_data.join("models");
             fs::create_dir_all(&models_path)?;
             let mut settings = load_settings(&settings_path);
@@ -2496,10 +3135,17 @@ pub fn run() {
             whisper_cache
                 .configure_idle(settings.idle_unload_enabled, settings.idle_unload_seconds);
             logbuf::set_debug_enabled(settings.debug_logging);
+            if let Err(error) = history.recover_pending() {
+                logbuf::warn(error);
+            }
+            if let Err(error) = history.prune(settings.history_retention_days) {
+                logbuf::warn(error);
+            }
             app.manage(AppState {
                 settings: Mutex::new(settings.clone()),
                 settings_path,
-                history_path,
+                history,
+                stats_path,
                 models_path,
                 downloads: Mutex::new(HashMap::new()),
                 recorder: AudioRecorder::new(handle.clone()),
@@ -2512,6 +3158,12 @@ pub fn run() {
                 park_reason: Mutex::new(ParkReason::None),
                 saw_model_loaded: Mutex::new(false),
                 whisper_cache,
+                session_trigger: Mutex::new(Trigger::default()),
+                processing: AtomicBool::new(false),
+                cancel_generation: AtomicU64::new(0),
+                session_generation: AtomicU64::new(0),
+                last_dictation: Mutex::new(String::new()),
+                ducker: ducking::Ducker::new(),
             });
             if let Err(error) = apply_launch_at_login(&handle, settings.launch_at_login) {
                 eprintln!("VocaWin launch-at-login registration failed: {error}");
@@ -2558,6 +3210,16 @@ pub fn run() {
                     let _ = window.hide();
                 }
             }
+            if let Err(error) = overlay::create(&handle) {
+                logbuf::warn(format!("Could not create the status overlay: {error}"));
+            } else {
+                let ready = handle.clone();
+                std::thread::spawn(move || {
+                    // Give the overlay page a moment to load before it shows.
+                    std::thread::sleep(std::time::Duration::from_millis(700));
+                    show_ready_pill(&ready);
+                });
+            }
             let gpu = gpu::detect_gpu();
             logbuf::debug(format!("GPU: {} ({})", gpu.name, gpu.backend));
             logbuf::info("VocaWin ready.");
@@ -2594,7 +3256,19 @@ pub fn run() {
             preview_sound,
             inject_text,
             copy_text,
-            open_external
+            open_external,
+            delete_history_entry,
+            retry_history_entry,
+            play_history_audio,
+            stop_history_audio,
+            get_stats,
+            reset_stats,
+            preview_text,
+            export_settings,
+            parse_settings_backup,
+            get_overlay_phase,
+            set_overlay_width,
+            dismiss_overlay
         ])
         .run(tauri::generate_context!())
         .expect("error while running VocaWin");
@@ -2607,9 +3281,54 @@ fn register_dictation_hotkey(app: &AppHandle, hotkey_spec: &str) -> Result<(), S
     if let Some(state) = app.try_state::<AppState>() {
         if let Ok(settings) = state.settings.lock() {
             hook::set_safety_timeout(safety_timeout_for(settings.max_recording_seconds));
+            apply_extra_shortcuts(&settings);
         }
     }
     Ok(())
+}
+
+/// Hands-free, paste-last, and the mouse button. Invalid values were
+/// rejected by `save_settings`; anything unparsable is simply left unbound.
+fn apply_extra_shortcuts(settings: &Settings) {
+    let mut actions = Vec::new();
+    for (spec, event) in [
+        (&settings.hands_free_hotkey, hook::HookEvent::HandsFree),
+        (&settings.paste_last_hotkey, hook::HookEvent::PasteLast),
+    ] {
+        if spec.trim().is_empty() {
+            continue;
+        }
+        match hotkey::parse_hotkey(spec) {
+            Ok(parsed) => actions.push((parsed, event)),
+            Err(error) => logbuf::warn(format!("Shortcut {spec} ignored: {error}")),
+        }
+    }
+    hook::set_action_bindings(actions);
+    hook::set_mouse_button(hook::MouseButton::parse(&settings.mouse_button));
+}
+
+/// A shortcut for hands-free or paste-last: a non-empty value must parse, may
+/// not be a lone modifier (those are hold keys), and may not repeat another.
+fn validate_extra_shortcut(value: &str, label: &str, taken: &[&str]) -> Result<String, String> {
+    if value.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let canonical = hotkey::canonicalize(value)?;
+    if let hotkey::HotkeySpec::Lone { vk } = hotkey::parse_hotkey(&canonical)? {
+        if hotkey::is_modifier_vk(vk) {
+            return Err(format!(
+                "{label} needs a function key or a combo such as Ctrl+Alt+V, not a lone modifier."
+            ));
+        }
+    }
+    for other in taken {
+        if !other.trim().is_empty()
+            && hotkey::parse_hotkey(other).ok() == hotkey::parse_hotkey(&canonical).ok()
+        {
+            return Err(format!("{label} is already used by another VocaWin shortcut."));
+        }
+    }
+    Ok(canonical)
 }
 
 #[tauri::command]
@@ -2623,49 +3342,110 @@ fn resume_hotkey_listener() {
     hook::set_capture_paused(false);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PressDecision {
+    Start,
+    Stop,
+    Ignore,
+}
+
+/// What a press of the hotkey, the mouse button, or the hands-free shortcut
+/// does. The hands-free shortcut stops whatever is running; in toggle mode a
+/// second hotkey or mouse press ends the take (but not a hands-free one); a
+/// held key's typematic repeats do nothing.
+fn press_decision(live: bool, toggle_mode: bool, pressed: Trigger, running: Trigger) -> PressDecision {
+    if !live {
+        return PressDecision::Start;
+    }
+    match pressed {
+        Trigger::HandsFree => PressDecision::Stop,
+        Trigger::Toggle | Trigger::Mouse if toggle_mode && running != Trigger::HandsFree => {
+            PressDecision::Stop
+        }
+        _ => PressDecision::Ignore,
+    }
+}
+
+/// A key-up ends only the push-to-talk hold that started the take.
+fn release_ends_session(toggle_mode: bool, released: Trigger, running: Trigger) -> bool {
+    !toggle_mode && released == running
+}
+
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn on_hotkey_event(handle: &AppHandle, event: hook::HookEvent) {
     let state = handle.state::<AppState>();
-    if *state
+    let paused = *state
         .dictation_paused
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        && event == hook::HookEvent::Pressed
-    {
-        return;
-    }
+        .unwrap_or_else(|e| e.into_inner());
     let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
     let toggle = settings.activation_mode == "toggle";
+    let hotkey_trigger = if toggle { Trigger::Toggle } else { Trigger::Hold };
     match event {
-        hook::HookEvent::Pressed => {
-            let flag = *state.recording.lock().unwrap_or_else(|e| e.into_inner());
-            let live = state.recorder.capture_live();
-            match ptt_pressed_action(flag, live) {
-                PttPressedAction::Ignore => {}
-                PttPressedAction::Start => {
-                    logbuf::debug_and_emit(handle, "Hotkey pressed.");
-                    if let Err(error) = begin_voice_session(handle, true) {
-                        if error.contains("No speech model is installed") {
-                            sounds::play_error_if_enabled(&settings.sound_theme);
-                            logbuf::error_and_emit(handle, error.clone());
-                            let _ = handle.emit("dictation-error", error);
-                        }
-                    }
+        hook::HookEvent::Pressed if !paused => press(handle, &settings, hotkey_trigger),
+        hook::HookEvent::MouseDown if !paused => press(handle, &settings, Trigger::Mouse),
+        hook::HookEvent::HandsFree if !paused => press(handle, &settings, Trigger::HandsFree),
+        hook::HookEvent::Released => release(handle, toggle, hotkey_trigger),
+        hook::HookEvent::MouseUp => release(handle, toggle, Trigger::Mouse),
+        hook::HookEvent::Cancel => cancel_voice_session(handle),
+        hook::HookEvent::PasteLast if !paused => paste_last(handle),
+        _ => {}
+    }
+}
+
+fn press(handle: &AppHandle, settings: &Settings, trigger: Trigger) {
+    let state = handle.state::<AppState>();
+    let flag = *state.recording.lock().unwrap_or_else(|e| e.into_inner());
+    let live = ptt_pressed_action(flag, state.recorder.capture_live()) == PttPressedAction::Ignore;
+    let running = *state
+        .session_trigger
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let toggle = settings.activation_mode == "toggle";
+    match press_decision(live, toggle, trigger, running) {
+        PressDecision::Ignore => {}
+        PressDecision::Stop => {
+            logbuf::debug_and_emit(handle, "Shortcut pressed again; stopping.");
+            finish_voice_session(handle);
+        }
+        PressDecision::Start => {
+            logbuf::debug_and_emit(handle, "Hotkey pressed.");
+            let silence_auto_stop = match trigger {
+                Trigger::Toggle => true,
+                Trigger::Mouse => toggle,
+                _ => false,
+            };
+            if let Err(error) = begin_voice_session(handle, true, trigger, silence_auto_stop) {
+                if error.contains("No speech model is installed") {
+                    sounds::play_error_if_enabled(&settings.sound_theme);
+                    logbuf::error_and_emit(handle, error.clone());
+                    let _ = handle.emit("dictation-error", error.clone());
+                    overlay::show(
+                        handle,
+                        overlay::Phase::Error("Download a speech model first".into()),
+                        overlay_on(settings),
+                    );
                 }
             }
         }
-        hook::HookEvent::Released => {
-            if toggle {
-                return;
-            }
-            logbuf::debug_and_emit(handle, "Hotkey released.");
-            let recording = *state.recording.lock().unwrap_or_else(|e| e.into_inner());
-            if recording {
-                finish_voice_session(handle);
-            } else if state.session_opening.load(Ordering::SeqCst) {
-                state.release_during_open.store(true, Ordering::SeqCst);
-            }
-        }
+    }
+}
+
+fn release(handle: &AppHandle, toggle: bool, trigger: Trigger) {
+    let state = handle.state::<AppState>();
+    let running = *state
+        .session_trigger
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !release_ends_session(toggle, trigger, running) {
+        return;
+    }
+    logbuf::debug_and_emit(handle, "Hotkey released.");
+    let recording = *state.recording.lock().unwrap_or_else(|e| e.into_inner());
+    if recording {
+        finish_voice_session(handle);
+    } else if state.session_opening.load(Ordering::SeqCst) {
+        state.release_during_open.store(true, Ordering::SeqCst);
     }
 }
 
@@ -2696,7 +3476,9 @@ fn start_auto_pause_watcher(app: AppHandle) {
                 drop(paused);
                 hook::set_dictation_paused(true);
                 hook::clear_held_vk();
+                hook::set_cancel_armed(false);
                 abandon_voice_session(&state);
+                overlay::hide(&app);
                 let _ = app.emit("recording-changed", false);
                 state.whisper_cache.unload();
                 let app_name = hit.clone().unwrap_or_else(|| "a watched app".into());
@@ -2916,7 +3698,8 @@ fn show_main_window(app: &AppHandle) {
 }
 
 fn tray_start_voice(app: &AppHandle) -> Result<(), String> {
-    begin_voice_session(app, true)
+    let toggle = manual_silence_auto_stop(app);
+    begin_voice_session(app, true, Trigger::Manual, toggle)
 }
 
 fn tray_stop_voice(app: &AppHandle) -> Result<(), String> {
@@ -3501,5 +4284,147 @@ mod tests {
             safety_timeout_for(60.0),
             std::time::Duration::from_secs_f32(65.0)
         );
+    }
+
+    #[test]
+    fn a_press_starts_when_idle() {
+        for trigger in [Trigger::Hold, Trigger::Toggle, Trigger::HandsFree, Trigger::Mouse] {
+            assert_eq!(press_decision(false, false, trigger, Trigger::Hold), PressDecision::Start);
+        }
+    }
+
+    #[test]
+    fn toggle_mode_second_tap_stops_but_hold_repeats_do_not() {
+        // Push-to-talk: typematic repeats of the held key change nothing.
+        assert_eq!(press_decision(true, false, Trigger::Hold, Trigger::Hold), PressDecision::Ignore);
+        assert_eq!(press_decision(true, false, Trigger::Mouse, Trigger::Mouse), PressDecision::Ignore);
+        // Toggle: a second tap of the hotkey or mouse button ends the take.
+        assert_eq!(press_decision(true, true, Trigger::Toggle, Trigger::Toggle), PressDecision::Stop);
+        assert_eq!(press_decision(true, true, Trigger::Mouse, Trigger::Toggle), PressDecision::Stop);
+        // ...but never a hands-free take, which has its own shortcut.
+        assert_eq!(press_decision(true, true, Trigger::Toggle, Trigger::HandsFree), PressDecision::Ignore);
+        // The hands-free shortcut stops whatever is running.
+        assert_eq!(press_decision(true, false, Trigger::HandsFree, Trigger::Hold), PressDecision::Stop);
+    }
+
+    #[test]
+    fn a_release_only_ends_the_hold_that_started_the_take() {
+        assert!(release_ends_session(false, Trigger::Hold, Trigger::Hold));
+        assert!(release_ends_session(false, Trigger::Mouse, Trigger::Mouse));
+        assert!(!release_ends_session(false, Trigger::Hold, Trigger::HandsFree));
+        assert!(!release_ends_session(false, Trigger::Mouse, Trigger::Hold));
+        assert!(!release_ends_session(true, Trigger::Toggle, Trigger::Toggle));
+    }
+
+    #[test]
+    fn extra_shortcuts_reject_modifiers_and_duplicates() {
+        assert_eq!(validate_extra_shortcut("", "Hands-free", &["AltRight"]).unwrap(), "");
+        assert_eq!(validate_extra_shortcut("f9", "Hands-free", &["AltRight"]).unwrap(), "F9");
+        assert_eq!(
+            validate_extra_shortcut("ctrl+alt+v", "Paste", &["AltRight"]).unwrap(),
+            "Ctrl+Alt+V"
+        );
+        assert!(validate_extra_shortcut("ControlRight", "Hands-free", &["AltRight"])
+            .unwrap_err()
+            .contains("lone modifier"));
+        assert!(validate_extra_shortcut("F9", "Paste", &["AltRight", "F9"])
+            .unwrap_err()
+            .contains("already used"));
+    }
+
+    #[test]
+    fn settings_from_an_older_version_get_parity_defaults() {
+        let old = r#"{"hotkey":"AltRight","activationMode":"pushToTalk","language":"English",
+            "silenceSeconds":1.5,"launchAtLogin":false,"selectedModel":"whisper-tiny"}"#;
+        let settings: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(settings.cleanup_level, "medium");
+        assert!(settings.escape_cancels);
+        assert!(settings.skip_silence);
+        assert!(settings.ready_pill);
+        assert_eq!(settings.overlay_style, "minimal");
+        assert_eq!(settings.history_retention_days, 30);
+        assert!(!settings.numbers_as_digits && !settings.spoken_emoji && !settings.mute_other_audio);
+        assert!(settings.hands_free_hotkey.is_empty() && settings.paste_last_hotkey.is_empty());
+        // A file missing a field once required still loads the rest.
+        let partial: Settings = serde_json::from_str(r#"{"language":"German"}"#).unwrap();
+        assert_eq!(partial.language, "German");
+        assert_eq!(partial.hotkey, "AltRight");
+    }
+
+    #[test]
+    fn extra_settings_are_checked_and_tidied() {
+        let mut settings = Settings {
+            replacements: vec![
+                dictionary::Replacement {
+                    heard: "  get hub ".into(),
+                    replacement: " GitHub ".into(),
+                },
+                dictionary::Replacement {
+                    heard: " ".into(),
+                    replacement: "nothing".into(),
+                },
+            ],
+            snippets: vec![dictionary::Snippet {
+                trigger: "".into(),
+                expansion: "dropped".into(),
+            }],
+            hands_free_hotkey: "f8".into(),
+            ..Settings::default()
+        };
+        normalize_extra_settings(&mut settings).unwrap();
+        assert_eq!(settings.replacements.len(), 1);
+        assert_eq!(settings.replacements[0].heard, "get hub");
+        assert_eq!(settings.replacements[0].replacement, "GitHub");
+        assert!(settings.snippets.is_empty());
+        assert_eq!(settings.hands_free_hotkey, "F8");
+
+        let mut bad = Settings {
+            history_retention_days: 3,
+            ..Settings::default()
+        };
+        assert!(normalize_extra_settings(&mut bad).is_err());
+        let mut bad = Settings {
+            mouse_button: "left".into(),
+            ..Settings::default()
+        };
+        assert!(normalize_extra_settings(&mut bad).is_err());
+    }
+
+    #[test]
+    fn english_only_models_let_the_text_rules_assume_english() {
+        let mut settings = Settings {
+            language: "Auto-detect".into(),
+            selected_model: "moonshine-base".into(),
+            ..Settings::default()
+        };
+        assert_eq!(text_language(&settings), Some("en"));
+        settings.selected_model = "whisper-base".into();
+        assert_eq!(text_language(&settings), None);
+        settings.language = "German".into();
+        assert_eq!(text_language(&settings), Some("de"));
+    }
+
+    #[test]
+    fn transcripts_get_the_dictionary_and_spoken_forms() {
+        let settings = Settings {
+            numbers_as_digits: true,
+            spoken_emoji: true,
+            replacements: vec![dictionary::Replacement {
+                heard: "get hub".into(),
+                replacement: "GitHub".into(),
+            }],
+            ..Settings::default()
+        };
+        assert_eq!(
+            format_transcript(&settings, "um push twenty three commits to get hub, party emoji"),
+            "Push 23 commits to GitHub, 🎉 "
+        );
+    }
+
+    #[test]
+    fn the_ready_pill_names_the_key_plainly() {
+        assert_eq!(hotkey_display("AltRight"), "Right Alt");
+        assert_eq!(hotkey_display("Ctrl+Shift+Space"), "Ctrl+Shift+Space");
+        assert_eq!(hotkey_display("Ctrl+Alt+K"), "Ctrl+Alt+K");
     }
 }

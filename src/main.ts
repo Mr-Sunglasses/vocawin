@@ -38,9 +38,53 @@ type Settings = {
   debugLogging: boolean;
   customVocabulary: string;
   copyToClipboard: boolean;
+  cleanupLevel: string;
+  numbersAsDigits: boolean;
+  numberSymbols: boolean;
+  spokenEmoji: boolean;
+  replacements: Replacement[];
+  snippets: Snippet[];
+  escapeCancels: boolean;
+  handsFreeHotkey: string;
+  pasteLastHotkey: string;
+  mouseButton: string;
+  overlayStyle: string;
+  overlayPosition: string;
+  readyPill: boolean;
+  skipSilence: boolean;
+  muteOtherAudio: boolean;
+  historyRetentionDays: number;
+  historyKeepAudio: boolean;
 };
-type View = "dictation" | "models" | "history" | "settings" | "debug" | "about";
-type HistoryEntry = { id: number; text: string; modelId: string; createdAtMs: number };
+type Replacement = { heard: string; replacement: string };
+type Snippet = { trigger: string; expansion: string };
+type View = "dictation" | "shortcuts" | "models" | "audio" | "formatting" | "dictionary" | "snippets" | "history" | "stats" | "settings" | "power" | "debug" | "about";
+type HistoryEntry = {
+  id: number;
+  text: string;
+  modelId: string;
+  createdAtMs: number;
+  audioFile?: string;
+  durationMs?: number;
+  status?: string;
+  error?: string;
+};
+type StatsSummary = {
+  dictations: number;
+  words: number;
+  characters: number;
+  audioMinutes: number;
+  wordsPerMinute: number;
+  timeSavedMinutes: number;
+  wordsToday: number;
+  wordsThisWeek: number;
+  currentStreak: number;
+  longestStreak: number;
+  activeDays: number;
+  recent: Array<{ day: string; words: number }>;
+};
+/** Which shortcut the Record button is capturing. */
+type CaptureTarget = "hotkey" | "handsFreeHotkey" | "pasteLastHotkey";
 type ModelStatus = { installed: boolean; downloadable: boolean; downloading: boolean; progress: number; message?: string; bytesOnDisk?: number };
 type HotkeyPreset = { id: string; label: string };
 type GpuStatus = {
@@ -81,13 +125,55 @@ type RunningApp = { name: string; label: string };
 type EngineFilter = "all" | "whisper" | "onnx";
 type LanguageFilter = "any" | "english" | "multilingual";
 
+/** One searchable settings row. `page` is the sidebar page it lives on;
+ *  `card` groups rows inside that page. */
 type SettingsItem = {
-  group: "Dictation" | "Audio" | "Application";
+  page: View;
+  card: string;
   title: string;
   subtitle: string;
   keywords: string;
   html: string;
+  /** Control sits under the text instead of beside it. */
+  wide?: boolean;
+  /** Extra markup under the row (the watched-app chips). */
+  after?: string;
 };
+
+/** Sidebar sections, in VocaMac's order: Dictation, Writing, Activity, App. */
+const NAV_SECTIONS: Array<{ label: string; items: Array<[View, string, string]> }> = [
+  { label: "Dictation", items: [["dictation", "Dictation", "◉"], ["shortcuts", "Shortcuts", "⌨"], ["models", "Models", "◇"], ["audio", "Audio", "♪"]] },
+  { label: "Writing", items: [["formatting", "Formatting", "¶"], ["dictionary", "Dictionary", "✎"], ["snippets", "Snippets", "⧉"]] },
+  { label: "Activity", items: [["history", "History", "≡"], ["stats", "Stats", "▦"]] },
+  { label: "App", items: [["settings", "General", "⚙"], ["power", "Power", "⏻"], ["debug", "Debug", "⌗"], ["about", "About", "ⓘ"]] },
+];
+const ALL_VIEWS: View[] = NAV_SECTIONS.flatMap(section => section.items.map(([id]) => id));
+
+/** Shortcut choices for hands-free and paste-last. Lone modifiers are hold
+ *  keys, so they are left to the main hotkey. */
+const EXTRA_SHORTCUTS: Array<[string, string]> = [
+  ["", "Off"],
+  ["F7", "F7"],
+  ["F8", "F8"],
+  ["F9", "F9"],
+  ["F10", "F10"],
+  ["Ctrl+Alt+Space", "Ctrl+Alt+Space"],
+  ["Ctrl+Shift+Space", "Ctrl+Shift+Space"],
+  ["Ctrl+Alt+V", "Ctrl+Alt+V"],
+  ["Ctrl+Shift+Alt+V", "Ctrl+Shift+Alt+V"],
+];
+const MOUSE_BUTTONS: Array<[string, string]> = [
+  ["", "Off"],
+  ["middle", "Middle button"],
+  ["x1", "Back side button"],
+  ["x2", "Forward side button"],
+];
+const RETENTION_CHOICES: Array<[number, string]> = [
+  [1, "1 day"],
+  [7, "7 days"],
+  [30, "30 days"],
+  [0, "Forever"],
+];
 
 const ENGINE_FILTERS: Array<[EngineFilter, string]> = [
   ["all", "All engines"],
@@ -196,6 +282,17 @@ const app = document.querySelector<HTMLDivElement>("#app")!;
 let models: Model[] = [];
 let statuses: Record<string, ModelStatus> = {};
 let history: HistoryEntry[] = [];
+let historyQuery = "";
+let stats: StatsSummary | null = null;
+let retrying = new Set<number>();
+let playingId: number | null = null;
+let tryText = "";
+let tryResult = "";
+/** Page to return to when the sidebar search is cleared. */
+let pageBeforeSearch: View | null = null;
+let onboardingStep = 0;
+let onboardingModel = "";
+let onboardingTryText = "";
 let settings: Settings;
 let presets: HotkeyPreset[] = [];
 let gpu: GpuStatus = {
@@ -222,7 +319,7 @@ let runtime: RuntimeStatus = {
   gpuBackend: "",
 };
 let recording = false;
-let recordingHotkey = false;
+let recordingHotkey: CaptureTarget | null = null;
 let testingDictation = false;
 let testListening = false;
 let testResult = "";
@@ -254,7 +351,7 @@ const formatBytes = (bytes?: number) => {
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(bytes >= 100 * 1024 * 1024 ? 0 : 1)} MB on disk`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB on disk`;
 };
-const nav = (id: View, label: string, icon: string) => `<button class="nav ${view === id ? "active" : ""}" data-view="${id}"><span class="nav-icon">${icon}</span>${label}</button>`;
+const nav = (id: View, label: string, icon: string, count = 0) => `<button class="nav ${view === id ? "active" : ""}" data-view="${id}"><span class="nav-icon">${icon}</span>${label}${count ? `<span class="nav-count" aria-label="${count} matching settings">${count}</span>` : ""}</button>`;
 
 function emptySpeechMessage() {
   return modelInstalled()
@@ -512,7 +609,7 @@ function dictationPage() {
   const statusHint = recording
     ? (testListening
       ? "This take stays in VocaWin. Stop it from the sidebar Test control."
-      : "Speak now. Text lands at the caret when you finish.")
+      : `Speak now. Text lands at the caret when you finish.${settings.escapeCancels ? " Esc cancels." : ""}`)
     : "Text lands at the caret in the focused app.";
   const hotkeyLabelText = recording
     ? (testListening ? "PRACTICE" : "LISTENING")
@@ -569,8 +666,11 @@ function modelsPage() {
   const tip = recommendation
     ? `<p class="hw-tip"><strong>Starting size:</strong> ${escape(recommendation.modelName)}. ${escape(recommendation.reason)}</p>`
     : "";
-  return `<header><div><p class="overline">ON-DEVICE MODELS</p><h1>Choose your <em>engine.</em></h1><p class="lede">Models stay on your PC. Pick the trade-off between speed, accuracy, and language coverage.</p></div></header>
+  const header = `<header><div><p class="overline">ON-DEVICE MODELS</p><h1>Choose your <em>engine.</em></h1><p class="lede">Models stay on your PC. Pick the trade-off between speed, accuracy, and language coverage.</p></div></header>`;
+  if (searchQuery()) return `${header}${settingsCards("models")}`;
+  return `${header}
   ${tip}
+  ${settingsCards("models")}
   <div class="model-filters">
     <input id="model-search" type="search" placeholder="Search models" value="${escape(modelQuery)}" />
     <label class="filter-combo"><span class="vh">Engine</span>
@@ -583,16 +683,6 @@ function modelsPage() {
     </label>
   </div>
   <div class="model-grid compact">${modelCards()}</div>`;
-}
-
-function historyPage() {
-  const entries = history.length
-    ? history.map(entry => `<article class="history-entry"><p>${escape(entry.text)}</p><footer>${escape(models.find(model => model.id === entry.modelId)?.name ?? entry.modelId)} · ${new Date(entry.createdAtMs).toLocaleString()}</footer></article>`).join("")
-    : `<div class="empty-history">${settings.historyEnabled ? "Your local transcription history will appear here." : "Nothing is saved yet. Turn history back on in Settings if you want new takes kept on this PC."}</div>`;
-  const lede = settings.historyEnabled
-    ? "History is stored only on this computer and can be cleared at any time."
-    : "New takes are not being saved. Older entries stay on this PC until you clear them.";
-  return `<header><div><p class="overline">LOCAL HISTORY</p><h1>Your recent <em>dictation.</em></h1><p class="lede">${lede}</p></div>${history.length ? `<button class="quiet-button" id="clear-history">Clear history</button>` : ""}</header><section class="history-list">${entries}</section>`;
 }
 
 function chipLabel(name: string) {
@@ -631,29 +721,6 @@ function idleUnloadOptions() {
   ).join("");
 }
 
-function powerMatches(query: string) {
-  if (!query) return true;
-  const hay = "power pause while these apps are running voca stays quiet so they can use the mic unload the model after idle frees ram next dictation loads it again never minutes hour autopause";
-  return query.split(/\s+/).every(part => hay.includes(part));
-}
-
-function powerSection() {
-  return `<section class="settings-card power-card" data-settings-group="Power"><p class="settings-group">Power</p>
-    <div class="setting-row">
-      <div><strong>Pause while these apps are running</strong><p>Voca stays quiet so they can use the mic.</p></div>
-      <select id="auto-pause-app" class="themed-select power-combo">${runningAppOptions()}</select>
-    </div>
-    <div class="power-chips">
-      <div id="watched-app-chips">${watchedAppChips()}</div>
-      <p class="power-note">Empty list means off. Each chip removes that app.</p>
-    </div>
-    <div class="setting-row">
-      <div><strong>Unload the model after idle</strong><p>Frees RAM. Next dictation loads it again.</p></div>
-      <select id="idle-unload" class="themed-select power-combo">${idleUnloadOptions()}</select>
-    </div>
-  </section>`;
-}
-
 function previewSoundControl() {
   const label = previewStartNext ? "Preview start" : "Preview end";
   const icon = previewStartNext ? ICON_PLAY : ICON_STOP;
@@ -661,68 +728,126 @@ function previewSoundControl() {
   return `<button type="button" class="quiet-button preview-sound" id="preview-sound" ${off ? "disabled " : ""}aria-label="${label}" title="${label}">${icon}</button>`;
 }
 
+function switchControl(id: string, checked: boolean, disabled = false) {
+  return `<label class="switch"><input id="${id}" type="checkbox" ${checked ? "checked" : ""} ${disabled ? "disabled" : ""}/><span></span></label>`;
+}
+
+function selectControl(id: string, options: Array<[string, string]>, current: string) {
+  return `<select id="${id}" class="themed-select">${options.map(([value, label]) => `<option value="${escape(value)}" ${value === current ? "selected" : ""}>${escape(label)}</option>`).join("")}</select>`;
+}
+
+/** Hands-free and paste-last: presets, plus Record for any combo. */
+function extraShortcutControl(target: CaptureTarget) {
+  const current = settings[target] as string;
+  const options = EXTRA_SHORTCUTS.some(([value]) => value === current)
+    ? EXTRA_SHORTCUTS
+    : [...EXTRA_SHORTCUTS, [current, `Custom: ${current}`] as [string, string]];
+  const id = target === "handsFreeHotkey" ? "hands-free-hotkey" : "paste-last-hotkey";
+  return `<div class="hotkey-controls">${selectControl(id, options, current)}
+    <button type="button" class="quiet-button" data-capture="${target}">${recordingHotkey === target ? "Cancel" : "Record"}</button></div>`;
+}
+
+function replacementsEditor() {
+  const rows = settings.replacements.map((entry, index) => `<li class="pair-row">
+      <span class="pair-from">${escape(entry.heard)}</span><span class="pair-arrow" aria-hidden="true">→</span><span class="pair-to">${escape(entry.replacement)}</span>
+      <button type="button" class="pair-remove" data-remove-replacement="${index}" title="Remove" aria-label="Remove ${escape(entry.heard)}">×</button>
+    </li>`).join("");
+  return `<div class="pair-editor">
+    ${rows ? `<ul class="pair-list">${rows}</ul>` : `<p class="pair-empty">No replacements yet.</p>`}
+    <div class="pair-form">
+      <input id="replacement-heard" class="draft" type="text" placeholder="Heard, e.g. get hub" autocomplete="off" />
+      <input id="replacement-to" class="draft" type="text" placeholder="Type instead, e.g. GitHub" autocomplete="off" />
+      <button type="button" class="quiet-button" id="add-replacement">Add</button>
+    </div>
+  </div>`;
+}
+
+function snippetsEditor() {
+  const rows = settings.snippets.map((entry, index) => `<li class="pair-row snippet">
+      <span class="pair-from">${escape(entry.trigger)}</span><span class="pair-arrow" aria-hidden="true">→</span><span class="pair-to">${escape(entry.expansion)}</span>
+      <button type="button" class="pair-remove" data-remove-snippet="${index}" title="Remove" aria-label="Remove ${escape(entry.trigger)}">×</button>
+    </li>`).join("");
+  return `<div class="pair-editor">
+    ${rows ? `<ul class="pair-list">${rows}</ul>` : `<p class="pair-empty">No snippets yet.</p>`}
+    <div class="pair-form snippet">
+      <input id="snippet-trigger" class="draft" type="text" placeholder="Say, e.g. my address" autocomplete="off" />
+      <textarea id="snippet-expansion" class="draft" rows="3" placeholder="Type, e.g. 221B Baker Street, London"></textarea>
+      <button type="button" class="quiet-button" id="add-snippet">Add</button>
+    </div>
+  </div>`;
+}
+
 function settingsItems(): SettingsItem[] {
   const levelPct = Math.min(100, Math.round(micLevel * 140));
   return [
     {
-      group: "Dictation",
+      page: "shortcuts",
+      card: "Dictation key",
       title: "Activation hotkey",
-      subtitle: "Pick a preset or press Record. New installs default to Right Alt (Option), the same hold-default as VocaLinux. AltGr (Ctrl+Right Alt) is not consumed, so layout characters still type. Escape cancels. The live listener pauses while recording.",
+      subtitle: "Pick a preset or press Record. New installs default to Right Alt (Option), the same hold-default as VocaLinux. AltGr (Ctrl+Right Alt) is not consumed, so layout characters still type. The live listener pauses while recording.",
       keywords: "hotkey shortcut keyboard record preset right alt altright",
       html: `<div class="hotkey-controls"><select id="hotkey-preset" class="themed-select">${hotkeyOptions()}</select>
-    <button type="button" class="quiet-button" id="record-hotkey">${recordingHotkey ? "Cancel" : "Record"}</button></div>`,
+    <button type="button" class="quiet-button" data-capture="hotkey">${recordingHotkey === "hotkey" ? "Cancel" : "Record"}</button></div>`,
     },
     {
-      group: "Dictation",
+      page: "shortcuts",
+      card: "Dictation key",
       title: "Activation style",
-      subtitle: "Hold to talk, or tap to toggle. Toggle uses silence auto-stop.",
-      keywords: "push to talk toggle mode",
+      subtitle: "Hold to talk, or tap to start and tap again to stop. Toggle also stops after the silence set on the Audio page.",
+      keywords: "push to talk toggle mode tap",
       html: `<select id="activation" class="themed-select"><option value="pushToTalk">Push to talk</option><option value="toggle">Toggle</option></select>`,
     },
     {
-      group: "Dictation",
+      page: "shortcuts",
+      card: "More ways to dictate",
+      title: "Hands-free shortcut",
+      subtitle: "Press once to start and again to stop, without holding a key. Silence does not end it; Max recording still does.",
+      keywords: "hands free handsfree toggle shortcut start stop long dictation",
+      html: extraShortcutControl("handsFreeHotkey"),
+    },
+    {
+      page: "shortcuts",
+      card: "More ways to dictate",
+      title: "Mouse button",
+      subtitle: "Dictate with the middle or a side mouse button, held or tapped like the hotkey. That button's normal click goes to VocaWin while this is on.",
+      keywords: "mouse button middle side back forward xbutton",
+      html: selectControl("mouse-button", MOUSE_BUTTONS, settings.mouseButton),
+    },
+    {
+      page: "shortcuts",
+      card: "More ways to dictate",
+      title: "Escape cancels dictation",
+      subtitle: "Escape throws a take away while it records, or keeps a transcription from being typed. At other times Escape reaches your apps as usual.",
+      keywords: "escape esc cancel discard throw away",
+      html: switchControl("escape-cancels", settings.escapeCancels),
+    },
+    {
+      page: "shortcuts",
+      card: "More ways to dictate",
+      title: "Paste last dictation",
+      subtitle: "Types your last dictation again at the caret, even with history off. Ctrl+Alt shortcuts can clash with AltGr keyboard layouts.",
+      keywords: "paste last again repeat retype shortcut",
+      html: extraShortcutControl("pasteLastHotkey"),
+    },
+    {
+      page: "models",
+      card: "Language",
       title: "Dictation language",
       subtitle: "One list. Auto-detect is first, then English, then A to Z.",
       keywords: "language locale english auto detect",
       html: languageControl(),
     },
     {
-      group: "Dictation",
-      title: "Auto-capitalize",
-      subtitle: "Capitalize the start of sentences.",
-      keywords: "capitalize formatting output",
-      html: `<label class="switch"><input id="auto-cap" type="checkbox" ${settings.autoCapitalize ? "checked" : ""}/><span></span></label>`,
-    },
-    {
-      group: "Dictation",
-      title: "Trailing space",
-      subtitle: "Append a space after each utterance.",
-      keywords: "space formatting output",
-      html: `<label class="switch"><input id="trailing-space" type="checkbox" ${settings.appendTrailingSpace ? "checked" : ""}/><span></span></label>`,
-    },
-    {
-      group: "Dictation",
-      title: "Copy to clipboard",
-      subtitle: "Leave recognized text on the clipboard after each take. Off by default so dictation does not replace what you already copied.",
-      keywords: "clipboard paste preserve copy output",
-      html: `<label class="switch"><input id="copy-to-clipboard" type="checkbox" ${settings.copyToClipboard ? "checked" : ""}/><span></span></label>`,
-    },
-    {
-      group: "Dictation",
-      title: "Custom Vocabulary",
-      subtitle: "Bias Whisper toward names and jargon. It is a hint, not a guarantee.",
-      keywords: "custom vocabulary dictionary glossary names jargon initial prompt whisper",
-      html: `<textarea id="custom-vocabulary" rows="5" placeholder="kubectl, PostgreSQL, nginx, Grafana">${escape(settings.customVocabulary)}</textarea>`,
-    },
-    {
-      group: "Audio",
+      page: "audio",
+      card: "Microphone",
       title: "Microphone",
       subtitle: "WASAPI capture device used for dictation.",
       keywords: "mic microphone device wasapi input",
       html: `<select id="input-device" class="themed-select">${deviceOptions()}</select>`,
     },
     {
-      group: "Audio",
+      page: "audio",
+      card: "Microphone",
       title: "Mic Test",
       subtitle: "Level meter only. Does not recognize or inject text.",
       keywords: "mic test level meter volume",
@@ -730,21 +855,40 @@ function settingsItems(): SettingsItem[] {
       <div class="level-meter" aria-hidden="true"><span style="width:${levelPct}%"></span></div></div>`,
     },
     {
-      group: "Audio",
+      page: "audio",
+      card: "Recording",
       title: "Silence auto-stop",
-      subtitle: "Seconds of quiet before toggle mode ends a take. Push-to-talk ignores this and stops on key-up.",
+      subtitle: "Seconds of quiet before a toggled take ends. Push-to-talk and the hands-free shortcut ignore this.",
       keywords: "vad silence timeout toggle",
       html: `<input id="silence" type="number" min="0.3" max="10" step="0.1" value="${settings.silenceSeconds}" />`,
     },
     {
-      group: "Audio",
+      page: "audio",
+      card: "Recording",
       title: "Max recording",
       subtitle: "Hard stop so a stuck session cannot run forever.",
       keywords: "duration limit max",
       html: `<input id="max-recording" type="number" min="3" max="300" step="1" value="${settings.maxRecordingSeconds}" />`,
     },
     {
-      group: "Audio",
+      page: "audio",
+      card: "Recording",
+      title: "Skip silence before transcribing",
+      subtitle: "Cuts quiet stretches so the model only hears speech. Faster, and Whisper has no silence to invent words over.",
+      keywords: "silence skip trim vad quiet hallucination",
+      html: switchControl("skip-silence", settings.skipSilence),
+    },
+    {
+      page: "audio",
+      card: "Recording",
+      title: "Mute other audio while dictating",
+      subtitle: "Mutes apps that are playing sound while you record, then unmutes exactly those. Apps you muted yourself stay muted.",
+      keywords: "mute duck music video audio other apps sound",
+      html: switchControl("mute-other-audio", settings.muteOtherAudio),
+    },
+    {
+      page: "audio",
+      card: "Sounds",
       title: "Dictation sounds",
       subtitle: "These play when listening starts and stops. Preview is two clicks: start tone, then end tone.",
       keywords: "sound beep audio cue",
@@ -752,42 +896,367 @@ function settingsItems(): SettingsItem[] {
       ${previewSoundControl()}</div>`,
     },
     {
-      group: "Application",
+      page: "formatting",
+      card: "Cleanup",
+      title: "Cleanup",
+      subtitle: "Medium removes “um” and “uh”, a letter said three times (“I I I”), and keeps only the fix when you correct a day, month, number, or time (“tomorrow, no, Wednesday” → “Wednesday”). None types every word as heard.",
+      keywords: "cleanup filler um uh hesitation stutter correction",
+      html: selectControl("cleanup-level", [["medium", "Medium"], ["none", "None"]], settings.cleanupLevel),
+    },
+    {
+      page: "formatting",
+      card: "Formatting",
+      title: "Auto-capitalize",
+      subtitle: "Capitalize the start of sentences.",
+      keywords: "capitalize formatting output",
+      html: switchControl("auto-cap", settings.autoCapitalize),
+    },
+    {
+      page: "formatting",
+      card: "Formatting",
+      title: "Trailing space",
+      subtitle: "Append a space after each utterance.",
+      keywords: "space formatting output",
+      html: switchControl("trailing-space", settings.appendTrailingSpace),
+    },
+    {
+      page: "formatting",
+      card: "Spoken forms",
+      title: "Write numbers as digits",
+      subtitle: "“twenty three” becomes “23”, “seven thirty pm” becomes “7:30 pm”, “my number is nine eight seven…” becomes digits. English only. “High five” and “no one” keep their words.",
+      keywords: "numbers digits spoken number phone time year",
+      html: switchControl("numbers-as-digits", settings.numbersAsDigits),
+    },
+    {
+      page: "formatting",
+      card: "Spoken forms",
+      title: "Use symbols and ordinals",
+      subtitle: "With digits on: “fifty percent” → “50%”, “five dollars and fifty cents” → “$5.50”, “the twenty first” → “21st”, “June twenty second” → “June 22”.",
+      keywords: "percent dollar currency ordinal date symbols",
+      html: switchControl("number-symbols", settings.numberSymbols, !settings.numbersAsDigits),
+    },
+    {
+      page: "formatting",
+      card: "Spoken forms",
+      title: "Spoken emoji",
+      subtitle: "Say “party emoji” for 🎉 or “three fire emojis” for 🔥🔥🔥. Talking about one (“send a fire emoji”) keeps the words.",
+      keywords: "emoji emoticon smiley",
+      html: switchControl("spoken-emoji", settings.spokenEmoji),
+    },
+    {
+      page: "formatting",
+      card: "Output",
+      title: "Copy to clipboard",
+      subtitle: "Leave recognized text on the clipboard after each take. Off by default so dictation does not replace what you already copied.",
+      keywords: "clipboard paste preserve copy output",
+      html: switchControl("copy-to-clipboard", settings.copyToClipboard),
+    },
+    {
+      page: "dictionary",
+      card: "Vocabulary",
+      wide: true,
+      title: "Vocabulary",
+      subtitle: "Names and jargon spelled your way with every model: “voca win” becomes “VocaWin”. Whisper also gets them as a recognition hint. One per line, or comma-separated.",
+      keywords: "custom vocabulary dictionary glossary names jargon initial prompt whisper spelling",
+      html: `<textarea id="custom-vocabulary" rows="5" placeholder="VocaWin, kubectl, PostgreSQL, Grafana">${escape(settings.customVocabulary)}</textarea>`,
+    },
+    {
+      page: "dictionary",
+      card: "Replacements",
+      wide: true,
+      title: "Replacements",
+      subtitle: "Type something else when a model gets a word wrong: “get hub” → “GitHub”. Separate several spoken forms with commas. Matching ignores case.",
+      keywords: "replacements replace correct misheard dictionary",
+      html: replacementsEditor(),
+    },
+    {
+      page: "snippets",
+      card: "Snippets",
+      wide: true,
+      title: "Custom snippets",
+      subtitle: "Say a trigger and VocaWin types your saved text exactly as written, never re-cased: “my address” → your full address.",
+      keywords: "snippets trigger expansion text shortcut template",
+      html: snippetsEditor(),
+    },
+    {
+      page: "history",
+      card: "History settings",
+      title: "Keep dictation history",
+      subtitle: "When this is off, new takes are not added to History. Older entries stay until they expire or you clear them.",
+      keywords: "history transcript save local",
+      html: switchControl("history-enabled", settings.historyEnabled),
+    },
+    {
+      page: "history",
+      card: "History settings",
+      title: "Keep history for",
+      subtitle: "Older dictations and their audio are deleted from this PC.",
+      keywords: "history retention delete days forever expire",
+      html: selectControl("history-retention", RETENTION_CHOICES.map(([value, label]) => [String(value), label]), String(settings.historyRetentionDays)),
+    },
+    {
+      page: "history",
+      card: "History settings",
+      title: "Keep audio for replay and retry",
+      subtitle: "The last 50 takes keep their audio on this PC so you can replay them or retry with another model. It is saved before transcribing, so a crash never loses what you said.",
+      keywords: "history audio replay retry recording save crash",
+      html: switchControl("history-keep-audio", settings.historyKeepAudio),
+    },
+    {
+      page: "settings",
+      card: "Startup",
       title: "Launch at login",
       subtitle: "Start VocaWin with Windows for this user (starts minimized).",
       keywords: "startup autostart login",
-      html: `<label class="switch"><input id="launch-login" type="checkbox" ${settings.launchAtLogin ? "checked" : ""}/><span></span></label>`,
+      html: switchControl("launch-login", settings.launchAtLogin),
     },
     {
-      group: "Application",
-      title: "Keep dictation history",
-      subtitle: "When this is off, new takes are not added to History. Older entries stay until you clear them.",
-      keywords: "history transcript save local",
-      html: `<label class="switch"><input id="history-enabled" type="checkbox" ${settings.historyEnabled ? "checked" : ""}/><span></span></label>`,
+      page: "settings",
+      card: "Startup",
+      title: "Ready pill at launch",
+      subtitle: "Shows “VocaWin is ready” on screen for a few seconds after it starts, since Windows often hides new tray icons.",
+      keywords: "ready pill startup notification started running launch indicator",
+      html: switchControl("ready-pill", settings.readyPill),
+    },
+    {
+      page: "settings",
+      card: "Recording overlay",
+      title: "Recording overlay",
+      subtitle: "A small pill with a live level while you speak and a spinner while it transcribes. It never takes focus from the app you are typing into.",
+      keywords: "overlay pill indicator hud waveform recording",
+      html: selectControl("overlay-style", [["minimal", "Minimal pill"], ["off", "Off"]], settings.overlayStyle),
+    },
+    {
+      page: "settings",
+      card: "Recording overlay",
+      title: "Overlay position",
+      subtitle: "Centered on the screen your mouse is on.",
+      keywords: "overlay position top bottom screen",
+      html: selectControl("overlay-position", [["bottom", "Bottom of screen"], ["top", "Top of screen"]], settings.overlayPosition),
+    },
+    {
+      page: "settings",
+      card: "Backup",
+      title: "Settings backup",
+      subtitle: "Export writes your preferences, dictionary, and snippets to a JSON file in Downloads. Import reads one back. No audio, history, or models.",
+      keywords: "export import backup restore settings move",
+      html: `<div class="button-pair"><button type="button" class="quiet-button" id="export-settings">Export</button><button type="button" class="quiet-button" id="import-settings">Import</button><input id="import-file" class="draft" type="file" accept=".json,application/json" hidden /></div>`,
+    },
+    {
+      page: "settings",
+      card: "Setup",
+      title: "Setup guide",
+      subtitle: "Walk through language, model, and a first dictation again.",
+      keywords: "setup onboarding welcome wizard guide",
+      html: `<button type="button" class="quiet-button" id="run-setup">Run setup</button>`,
+    },
+    {
+      page: "power",
+      card: "Power",
+      title: "Pause while these apps are running",
+      subtitle: "Voca stays quiet so they can use the mic.",
+      keywords: "power pause while apps running autopause game mic",
+      html: `<select id="auto-pause-app" class="themed-select power-combo">${runningAppOptions()}</select>`,
+      after: `<div class="power-chips"><div id="watched-app-chips">${watchedAppChips()}</div><p class="power-note">Empty list means off. Each chip removes that app.</p></div>`,
+    },
+    {
+      page: "power",
+      card: "Power",
+      title: "Unload the model after idle",
+      subtitle: "Frees RAM. Next dictation loads it again.",
+      keywords: "power unload model idle ram memory minutes hour",
+      html: `<select id="idle-unload" class="themed-select power-combo">${idleUnloadOptions()}</select>`,
     },
   ];
 }
 
-function settingsPage() {
-  const query = settingsQuery.trim().toLowerCase();
-  const items = settingsItems().filter(item => {
-    if (!query) return true;
-    const hay = `${item.group} ${item.title} ${item.subtitle} ${item.keywords}`.toLowerCase();
-    return hay.includes(query);
-  });
-  const groups: Array<SettingsItem["group"]> = ["Dictation", "Audio", "Application"];
-  const cards = groups.map(group => {
-    const rows = items.filter(item => item.group === group);
-    if (!rows.length) return "";
-    return `<section class="settings-card" data-settings-group="${group}"><p class="settings-group">${group}</p>
-      ${rows.map(item => `<div class="setting-row"><div><strong>${escape(item.title)}</strong><p>${escape(item.subtitle)}</p></div>${item.html}</div>`).join("")}
-      </section>`;
+function itemMatches(item: SettingsItem, query: string) {
+  return matchScore(item, query) > 0;
+}
+
+/** 3 when every word is in the title, 2 in the title or keywords, 1 anywhere
+ *  (the subtitle included), 0 for no match. Search jumps to the best page. */
+function matchScore(item: SettingsItem, query: string) {
+  const parts = query.split(/\s+/).filter(Boolean);
+  if (!parts.length) return 1;
+  const within = (text: string) => parts.every(part => text.toLowerCase().includes(part));
+  if (within(item.title)) return 3;
+  if (within(`${item.title} ${item.keywords}`)) return 2;
+  return within(`${item.card} ${item.title} ${item.subtitle} ${item.keywords}`) ? 1 : 0;
+}
+
+function searchQuery() {
+  return settingsQuery.trim().toLowerCase();
+}
+
+/** Matching settings per page while the sidebar search has text. */
+function pageMatchCounts() {
+  const counts = new Map<View, number>();
+  const query = searchQuery();
+  if (!query) return counts;
+  for (const item of settingsItems()) {
+    if (itemMatches(item, query)) counts.set(item.page, (counts.get(item.page) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function settingRow(item: SettingsItem) {
+  const text = `<div><strong>${escape(item.title)}</strong><p>${escape(item.subtitle)}</p></div>`;
+  return `<div class="setting-row ${item.wide ? "wide" : ""}">${text}${item.html}</div>${item.after ?? ""}`;
+}
+
+/** The page's settings, grouped into cards, filtered by the sidebar search. */
+function settingsCards(page: View) {
+  const query = searchQuery();
+  const items = settingsItems().filter(item => item.page === page && itemMatches(item, query));
+  const cards: string[] = [];
+  for (const card of [...new Set(items.map(item => item.card))]) {
+    const rows = items.filter(item => item.card === card);
+    cards.push(`<section class="settings-card" data-settings-group="${escape(card)}"><p class="settings-group">${escape(card)}</p>${rows.map(settingRow).join("")}</section>`);
+  }
+  return cards.join("");
+}
+
+function pageHeader(overline: string, title: string, lede: string, extra = "") {
+  return `<header><div><p class="overline">${overline}</p><h1>${title}</h1><p class="lede">${lede}</p></div>${extra}</header>`;
+}
+
+function captureHint() {
+  return recordingHotkey ? `<p class="recording-hint">Press a key combo, or Escape to cancel.</p>` : "";
+}
+
+function shortcutsPage() {
+  return `${pageHeader("SHORTCUTS", "Dictate <em>your way.</em>", "Hold a key, tap a shortcut, or use a mouse button. Escape throws a take away.")}
+  ${settingsCards("shortcuts")}${captureHint()}`;
+}
+
+function audioPage() {
+  return `${pageHeader("AUDIO", "Hear you <em>clearly.</em>", "Microphone, when a take ends, and what happens to other sound while you speak.")}
+  ${settingsCards("audio")}`;
+}
+
+function formattingPage() {
+  const tryCard = searchQuery() ? "" : `<section class="settings-card try-card"><p class="settings-group">Try it</p>
+    <div class="try-box">
+      <textarea id="try-input" class="draft" rows="3" placeholder="Type what a model might hear, e.g. um meet me at seven thirty pm, oh no, eight pm party emoji">${escape(tryText)}</textarea>
+      <button type="button" class="quiet-button" id="try-run">Try</button>
+      <p class="try-result ${tryResult ? "" : "muted"}">${tryResult ? escape(tryResult) : "The result appears here, formatted with your current settings. Nothing is typed."}</p>
+    </div></section>`;
+  return `${pageHeader("FORMATTING", "Text that <em>reads right.</em>", "Rules that run on this PC after every take, with every model. No language model is involved.")}
+  ${settingsCards("formatting")}${tryCard}`;
+}
+
+function dictionaryPage() {
+  return `${pageHeader("DICTIONARY", "Words <em>your way.</em>", "Your spellings and fixes apply to every speech model, after transcription, on this PC.")}
+  ${settingsCards("dictionary")}`;
+}
+
+function snippetsPage() {
+  return `${pageHeader("SNIPPETS", "Say less, <em>type more.</em>", "Triggers expand into text you saved. They are matched before any other formatting.")}
+  ${settingsCards("snippets")}`;
+}
+
+function historyStatus(entry: HistoryEntry) {
+  switch (entry.status) {
+    case "pending": return "Unfinished";
+    case "failed": return "Failed";
+    case "cancelled": return "Cancelled, not typed";
+    default: return "";
+  }
+}
+
+function historyEntryMarkup(entry: HistoryEntry) {
+  const model = models.find(item => item.id === entry.modelId)?.name ?? entry.modelId;
+  const seconds = entry.durationMs ? ` · ${Math.max(1, Math.round(entry.durationMs / 1000))}s` : "";
+  const status = historyStatus(entry);
+  const body = entry.text
+    ? `<p>${escape(entry.text)}</p>`
+    : `<p class="history-missing">${escape(entry.error || (entry.status === "pending" ? "This take did not finish." : "No text."))}</p>`;
+  const id = String(entry.id);
+  const busy = retrying.has(entry.id);
+  const actions = [
+    entry.text ? `<button type="button" class="text-button" data-copy-history="${id}">Copy</button>` : "",
+    entry.audioFile ? `<button type="button" class="text-button" data-play-history="${id}">${playingId === entry.id ? "Stop" : "Play"}</button>` : "",
+    entry.audioFile ? `<button type="button" class="text-button" data-retry-history="${id}" ${busy ? "disabled" : ""}>${busy ? "Retrying…" : "Retry"}</button>` : "",
+    `<button type="button" class="text-button danger" data-delete-history="${id}">Delete</button>`,
+  ].filter(Boolean).join("");
+  return `<article class="history-entry ${entry.status && entry.status !== "ok" ? `status-${escape(entry.status)}` : ""}">${body}
+    <footer><span>${escape(model)} · ${new Date(entry.createdAtMs).toLocaleString()}${seconds}${status ? ` · <b>${escape(status)}</b>` : ""}</span><span class="history-actions">${actions}</span></footer></article>`;
+}
+
+function historyPage() {
+  const cards = settingsCards("history");
+  if (searchQuery()) {
+    return `${pageHeader("LOCAL HISTORY", "Your recent <em>dictation.</em>", "History settings that match your search.")}${cards}`;
+  }
+  const query = historyQuery.trim().toLowerCase();
+  const list = query ? history.filter(entry => entry.text.toLowerCase().includes(query)) : history;
+  const entries = list.length
+    ? list.map(historyEntryMarkup).join("")
+    : `<div class="empty-history">${history.length
+      ? `No dictation matches “${escape(historyQuery)}”.`
+      : settings.historyEnabled ? "Your local transcription history will appear here." : "Nothing is saved yet. Turn history back on below if you want new takes kept on this PC."}</div>`;
+  const lede = settings.historyEnabled
+    ? "Stored only on this computer. Search, copy, replay, or retry a take with another model."
+    : "New takes are not being saved. Older entries stay on this PC until they expire or you clear them.";
+  const clear = history.length ? `<button class="quiet-button" id="clear-history">Clear history</button>` : "";
+  return `${pageHeader("LOCAL HISTORY", "Your recent <em>dictation.</em>", lede, clear)}
+    ${history.length ? `<div class="history-search"><input id="history-search" class="draft" type="search" placeholder="Search history" value="${escape(historyQuery)}" /></div>` : ""}
+    <section class="history-list">${entries}</section>
+    ${cards}`;
+}
+
+function formatMinutes(minutes: number) {
+  if (minutes < 1) return "under a minute";
+  if (minutes < 60) return `${Math.round(minutes)} min`;
+  const hours = Math.floor(minutes / 60);
+  const rest = Math.round(minutes % 60);
+  return rest ? `${hours} h ${rest} min` : `${hours} h`;
+}
+
+function statTile(label: string, value: string, note = "") {
+  return `<div class="stat-tile"><p class="card-label">${escape(label)}</p><strong>${escape(value)}</strong>${note ? `<span>${escape(note)}</span>` : ""}</div>`;
+}
+
+function statsPage() {
+  const summary = stats;
+  const header = pageHeader("STATS", "Your voice, <em>counted.</em>", "Kept only on this PC. Counted when a dictation is typed into another app; tests and retries do not count.",
+    summary && summary.dictations ? `<button class="quiet-button" id="reset-stats">Reset stats</button>` : "");
+  if (!summary || !summary.dictations) {
+    return `${header}<div class="empty-history">Dictate into any app and your totals, pace, and streak show up here.</div>`;
+  }
+  const max = Math.max(1, ...summary.recent.map(point => point.words));
+  const bars = summary.recent.map(point => {
+    const date = new Date(`${point.day}T12:00:00`);
+    const label = date.toLocaleDateString(undefined, { weekday: "narrow" });
+    const height = Math.round((point.words / max) * 100);
+    return `<div class="stat-bar" title="${escape(date.toLocaleDateString())}: ${point.words} words"><span style="height:${Math.max(point.words ? 4 : 0, height)}%"></span><small>${escape(label)}</small></div>`;
   }).join("");
-  const power = powerMatches(query) ? powerSection() : "";
-  return `<header><div><p class="overline">PREFERENCES</p><h1>Make it <em>yours.</em></h1><p class="lede">VocaWin only stores these choices locally on this PC. Each change is saved as you make it.</p></div></header>
-  <div class="settings-search"><input id="settings-search" type="search" placeholder="Search settings" value="${escape(settingsQuery)}" /></div>
-  ${cards}${power || (cards ? "" : `<div class="empty-history">No settings match “${escape(settingsQuery)}”.</div>`)}
-  ${recordingHotkey ? `<p class="recording-hint">Press a key combo, or Escape to cancel.</p>` : ""}`;
+  const days = (count: number) => `${count} day${count === 1 ? "" : "s"}`;
+  return `${header}
+    <section class="stat-grid">
+      ${statTile("Words dictated", summary.words.toLocaleString(), `${summary.dictations.toLocaleString()} dictations`)}
+      ${statTile("Time saved", formatMinutes(summary.timeSavedMinutes), "versus typing at 40 wpm")}
+      ${statTile("Speaking pace", summary.wordsPerMinute ? `${summary.wordsPerMinute} wpm` : "—", `${formatMinutes(summary.audioMinutes)} of speech`)}
+      ${statTile("Current streak", days(summary.currentStreak), `Longest ${days(summary.longestStreak)}`)}
+      ${statTile("This week", summary.wordsThisWeek.toLocaleString(), `${summary.wordsToday.toLocaleString()} today`)}
+      ${statTile("Active days", summary.activeDays.toLocaleString())}
+    </section>
+    <section class="settings-card stat-chart-card"><p class="settings-group">Last 14 days</p><div class="stat-chart" role="img" aria-label="Words dictated per day over the last 14 days">${bars}</div></section>`;
+}
+
+function generalPage() {
+  return `${pageHeader("GENERAL", "Make it <em>yours.</em>", "VocaWin only stores these choices locally on this PC. Each change is saved as you make it.")}
+  ${settingsCards("settings")}`;
+}
+
+function powerPage() {
+  return `${pageHeader("POWER", "Stay out of <em>the way.</em>", "Pause for apps that need the microphone, and give memory back when you are not dictating.")}
+  ${settingsCards("power")}`;
+}
+
+function searchEmptyState() {
+  return `${pageHeader("SEARCH", "Nothing <em>found.</em>", `No settings match “${escape(settingsQuery)}”. Try another word, or clear the search.`)}`;
 }
 
 function debugFact(label: string, value: string) {
@@ -883,16 +1352,115 @@ function aboutPage() {
     </section>`;
 }
 
-function welcomeOverlay() {
+/** Languages Parakeet TDT v3 transcribes, among the ones VocaWin lists. */
+const PARAKEET_LANGUAGES = ["English", "Spanish", "French", "German", "Italian", "Portuguese", "Dutch", "Russian", "Polish", "Ukrainian", "Swedish", "Danish", "Finnish", "Czech", "Greek", "Romanian", "Hungarian"];
+
+/** Whether a catalog model can transcribe `language` ("Auto-detect" means
+ *  several languages, so it needs a multilingual model). */
+function modelSpeaks(model: Model, language: string) {
+  const multilingual = (list: string[]) => language === "Auto-detect" ? list.length > 1 : list.includes(language);
+  if (model.engine === "whisper.cpp") return modelIsEnglishOnly(model) ? language === "English" : true;
+  switch (model.id) {
+    case "parakeet-tdt-0.6b-v3": return multilingual(PARAKEET_LANGUAGES);
+    case "sensevoice-small": return multilingual(["Chinese", "Japanese", "Korean", "English"]);
+    case "canary-180m": return multilingual(["English", "Spanish", "German", "French"]);
+    case "gigaam-v3": return language === "Russian";
+    default: return language === "English" && modelIsEnglishOnly(model);
+  }
+}
+
+/** Up to three models for the setup guide: this PC's suggested size first
+ *  when it fits, then specialists for the language, then the rest. */
+function suggestedModels(language: string) {
+  const fits = models.filter(model => modelSpeaks(model, language));
+  const preferred: string[] = [];
+  if (recommendation && fits.some(model => model.id === recommendation!.modelId)) preferred.push(recommendation.modelId);
+  if (language === "English") preferred.push("parakeet-tdt-0.6b-v3", "moonshine-base");
+  else if (language === "Russian") preferred.push("gigaam-v3", "parakeet-tdt-0.6b-v3");
+  else if (["Chinese", "Japanese", "Korean"].includes(language)) preferred.push("sensevoice-small");
+  else if (PARAKEET_LANGUAGES.includes(language)) preferred.push("parakeet-tdt-0.6b-v3");
+  preferred.push("whisper-small", "whisper-base");
+  const ordered = [...preferred.map(id => fits.find(model => model.id === id)), ...fits]
+    .filter((model): model is Model => !!model);
+  return [...new Map(ordered.map(model => [model.id, model])).values()].slice(0, 3);
+}
+
+const ONBOARDING_STEPS = ["Welcome", "Language", "Model", "Try it", "Done"];
+
+function onboardingOverlay() {
   if (settings.welcomeDismissed) return "";
+  const dots = ONBOARDING_STEPS.map((label, index) =>
+    `<li class="${index === onboardingStep ? "current" : index < onboardingStep ? "done" : ""}"><span>${escape(label)}</span></li>`).join("");
+  const key = `<kbd>${escape(hotkeyLabel())}</kbd>`;
+  const hold = settings.activationMode === "toggle" ? `Tap ${key}, speak, then tap it again.` : `Hold ${key}, speak, then let go.`;
+  let body = "";
+  let actions = "";
+  switch (onboardingStep) {
+    case 0:
+      body = `<h2 id="welcome-title">Private voice typing for Windows</h2>
+        <ul class="onboarding-points">
+          <li><strong>Talk anywhere.</strong> ${hold} Your words appear at the caret in the app you are using.</li>
+          <li><strong>Stays on this PC.</strong> After a model downloads, audio and text never leave this computer.</li>
+          <li><strong>Lives in the tray.</strong> Closing this window keeps VocaWin running. A small pill shows when it is listening.</li>
+        </ul>`;
+      actions = `<button type="button" class="text-button" id="onboarding-skip">Skip setup</button><button type="button" class="primary" data-onboarding-next>Get started</button>`;
+      break;
+    case 1:
+      body = `<h2 id="welcome-title">What do you speak?</h2>
+        <p>VocaWin suggests models that know your language. Pick Auto-detect if you switch between languages.</p>
+        <select id="onboarding-language" class="themed-select">${LANGUAGE_CHOICES.map(language => `<option value="${escape(language)}" ${language === (settings.language || "Auto-detect") ? "selected" : ""}>${escape(language === "Auto-detect" ? "Auto-detect (several languages)" : language)}</option>`).join("")}</select>`;
+      actions = `<button type="button" class="text-button" data-onboarding-back>Back</button><button type="button" class="primary" data-onboarding-next>Next</button>`;
+      break;
+    case 2: {
+      const suggestions = suggestedModels(settings.language || "Auto-detect");
+      if (!onboardingModel || !suggestions.some(model => model.id === onboardingModel)) {
+        onboardingModel = suggestions.find(model => statuses[model.id]?.installed)?.id ?? suggestions[0]?.id ?? settings.selectedModel;
+      }
+      const chosen = statuses[onboardingModel];
+      const rows = suggestions.map(model => {
+        const status = statuses[model.id];
+        const state = status?.downloading ? `Downloading ${status.progress}%` : status?.installed ? "On this PC" : model.size;
+        const note = recommendation?.modelId === model.id ? " · Suggested for this PC" : "";
+        return `<label class="onboarding-model ${model.id === onboardingModel ? "selected" : ""}">
+          <input type="radio" name="onboarding-model" value="${escape(model.id)}" ${model.id === onboardingModel ? "checked" : ""} />
+          <span><strong>${escape(model.name)}</strong><small>${escape(model.description)}${escape(note)}</small></span>
+          <em>${escape(state)}</em></label>`;
+      }).join("");
+      body = `<h2 id="welcome-title">Pick a speech model</h2>
+        <p>Models run on this PC. The download happens once; after that VocaWin works offline.</p>
+        <div class="onboarding-models">${rows || `<p>No model in the catalog covers that language yet. Go back and pick Auto-detect.</p>`}</div>`;
+      const label = chosen?.downloading ? `Downloading ${chosen.progress}%` : chosen?.installed ? "Use this model" : "Download and use";
+      actions = `<button type="button" class="text-button" data-onboarding-back>Back</button><button type="button" class="primary" id="onboarding-model-go" ${chosen?.downloading || !rows ? "disabled" : ""}>${label}</button>`;
+      break;
+    }
+    case 3:
+      body = `<h2 id="welcome-title">Try your first dictation</h2>
+        <p>Click in the box, then ${hold.charAt(0).toLowerCase()}${hold.slice(1)} Press Escape while speaking to throw a take away.</p>
+        <textarea id="onboarding-try" class="draft" rows="4" placeholder="Your words appear here.">${escape(onboardingTryText)}</textarea>
+        <p class="onboarding-note">${recording ? "Listening…" : "It works the same in any app: the text goes where the caret is."}</p>`;
+      actions = `<button type="button" class="text-button" data-onboarding-back>Back</button><button type="button" class="primary" data-onboarding-next>${onboardingTryText.trim() ? "Next" : "Skip for now"}</button>`;
+      break;
+    default:
+      body = `<h2 id="welcome-title">You are set</h2>
+        <ul class="onboarding-points">
+          <li><strong>${escape(hotkeyLabel())}</strong> dictates in any app. Change it, or add a hands-free shortcut or mouse button, on the Shortcuts page.</li>
+          <li><strong>Formatting</strong> has spoken numbers, emoji, and cleanup. <strong>Dictionary</strong> fixes names a model gets wrong.</li>
+          <li>VocaWin lives in the tray. Closing this window keeps it running.</li>
+        </ul>
+        <label class="onboarding-login">${switchControl("onboarding-login", settings.launchAtLogin)}<span>Start VocaWin when I sign in to Windows</span></label>`;
+      actions = `<button type="button" class="text-button" data-onboarding-back>Back</button><button type="button" class="primary" id="welcome-dismiss">Finish</button>`;
+  }
   return `<div class="welcome-overlay" role="dialog" aria-modal="true" aria-labelledby="welcome-title">
-    <div class="welcome-card">
-      <p class="overline">WELCOME</p>
-      <h2 id="welcome-title">VocaWin is in your tray</h2>
-      <p>Hold Right Alt (or your chosen hotkey) to dictate into any app. Keep VocaWin in the tray and talk where the caret already is. Optional: turn on Start on Login from the tray or Settings.</p>
-      <button class="primary" id="welcome-dismiss">Got it</button>
+    <div class="welcome-card onboarding">
+      <ol class="onboarding-steps" aria-label="Setup steps">${dots}</ol>
+      ${body}
+      <div class="onboarding-actions">${actions}</div>
     </div>
   </div>`;
+}
+
+function onboardingTrying() {
+  return !settings.welcomeDismissed && onboardingStep === 3;
 }
 
 function sidebarFooter() {
@@ -933,25 +1501,71 @@ function restorePaneScroll() {
   resetPaneScroll = false;
 }
 
+function sidebarNav() {
+  const counts = pageMatchCounts();
+  const searching = !!searchQuery();
+  return NAV_SECTIONS.map(section => {
+    const items = section.items
+      .filter(([id]) => !searching || counts.has(id))
+      .map(([id, label, icon]) => nav(id, label, icon, searching ? counts.get(id) ?? 0 : 0))
+      .join("");
+    return items ? `<p class="nav-section">${escape(section.label)}</p>${items}` : "";
+  }).join("") || `<p class="nav-empty">No settings match.</p>`;
+}
+
+/** VocaMac's search contract: filter pages, badge counts, jump to the first
+ *  page with matches, and restore the previous page when the search clears. */
+function applySettingsSearch(value: string) {
+  const was = searchQuery();
+  settingsQuery = value;
+  const query = searchQuery();
+  if (query && !was) pageBeforeSearch = view;
+  if (!query) {
+    if (pageBeforeSearch) view = pageBeforeSearch;
+    pageBeforeSearch = null;
+    return;
+  }
+  // Land on the page whose setting best matches, not merely the first
+  // page that mentions the word somewhere.
+  const best = new Map<View, number>();
+  for (const item of settingsItems()) {
+    const score = matchScore(item, query);
+    if (score > (best.get(item.page) ?? 0)) best.set(item.page, score);
+  }
+  const top = Math.max(0, ...best.values());
+  if ((best.get(view) ?? 0) < top) {
+    const first = ALL_VIEWS.find(id => best.get(id) === top);
+    if (first) view = first;
+  }
+}
+
 function render() {
   captureChrome();
   const pages: Record<View, () => string> = {
     dictation: dictationPage,
+    shortcuts: shortcutsPage,
     models: modelsPage,
+    audio: audioPage,
+    formatting: formattingPage,
+    dictionary: dictionaryPage,
+    snippets: snippetsPage,
     history: historyPage,
-    settings: settingsPage,
+    stats: statsPage,
+    settings: generalPage,
+    power: powerPage,
     debug: debugPage,
     about: aboutPage,
   };
+  const noMatches = !!searchQuery() && pageMatchCounts().size === 0;
   app.innerHTML = `<aside>
     <div class="brand"><span class="mark">${sidebarMark}</span><span>VocaWin</span><span class="brand-tag" title="Unsigned tester build">Beta</span></div>
-    <p class="brand-subtitle">Voice dictation, kept private.</p>
-    <nav>${nav("dictation", "Dictation", "◉")}${nav("models", "Models", "◇")}${nav("history", "History", "≡")}${nav("settings", "Settings", "⚙")}${nav("debug", "Debug", "⌗")}${nav("about", "About", "ⓘ")}</nav>
+    <div class="sidebar-search"><input id="settings-search" type="search" placeholder="Search settings" aria-label="Search settings" value="${escape(settingsQuery)}" /></div>
+    <nav>${sidebarNav()}</nav>
     ${sidebarFooter()}
   </aside>
   <main>
-    ${pages[view]()}
-    ${welcomeOverlay()}
+    ${noMatches ? searchEmptyState() : pages[view]()}
+    ${onboardingOverlay()}
   </main>`;
   bindChrome();
   restoreFocusedField();
@@ -961,12 +1575,24 @@ function render() {
 function openView(next: View) {
   view = next;
   resetPaneScroll = true;
-  if (next === "settings") {
+  if (searchQuery() && !pageMatchCounts().has(next)) {
+    settingsQuery = "";
+    pageBeforeSearch = null;
+  }
+  if (next === "power") {
     void Promise.all([refreshRunningApps(), refreshRuntime()]).then(render);
     return;
   }
   if (next === "debug") {
     void Promise.all([refreshLogs(), refreshDebugReport()]).then(render);
+    return;
+  }
+  if (next === "stats") {
+    void refreshStats().then(render);
+    return;
+  }
+  if (next === "history") {
+    void refreshHistory().then(render).catch(() => render());
     return;
   }
   render();
@@ -995,11 +1621,14 @@ function bindChrome() {
   bindWatchedAppChips();
   bindFilterCombo("#engine-filter", ENGINE_FILTERS, value => { engineFilter = value as EngineFilter; });
   bindFilterCombo("#language-filter", LANGUAGE_FILTERS, value => { languageFilter = value as LanguageFilter; });
-  bindLiveSearch("#settings-search", value => { settingsQuery = value; });
+  bindLiveSearch("#settings-search", applySettingsSearch);
   bindLiveSearch("#model-search", value => { modelQuery = value; });
-  document.querySelector("#record-hotkey")?.addEventListener("click", () => {
-    void toggleHotkeyRecording();
-  });
+  bindLiveSearch("#history-search", value => { historyQuery = value; });
+  document.querySelectorAll<HTMLButtonElement>("[data-capture]").forEach(button => button.addEventListener("click", () => {
+    void toggleHotkeyRecording(button.dataset.capture as CaptureTarget);
+  }));
+  bindPageActions();
+  bindOnboarding();
   const soundTheme = document.querySelector<HTMLSelectElement>("#sound-theme");
   const previewSound = document.querySelector<HTMLButtonElement>("#preview-sound");
   previewSound?.addEventListener("click", async () => {
@@ -1082,6 +1711,7 @@ function bindAutosave() {
   const persistFromEvent = (event: Event) => {
     const target = event.target as HTMLElement;
     if (target.id === "settings-search" || target.id === "model-search" || target.id === "engine-filter" || target.id === "language-filter" || target.id === "auto-pause-app") return;
+    if (target.classList.contains("draft")) return;
     void persistSettings();
   };
   document.querySelectorAll<HTMLElement>(".setting-row input, .setting-row select, .setting-row textarea, #debug-logging, #idle-unload").forEach(node => {
@@ -1141,6 +1771,24 @@ function collectSettingsFromDom() {
   if (debugLogging) settings.debugLogging = debugLogging.checked;
   const customVocabulary = document.querySelector<HTMLTextAreaElement>("#custom-vocabulary");
   if (customVocabulary) settings.customVocabulary = customVocabulary.value;
+  const pick = (id: string) => document.querySelector<HTMLSelectElement>(`#${id}`)?.value;
+  const checked = (id: string) => document.querySelector<HTMLInputElement>(`#${id}`)?.checked;
+  settings.handsFreeHotkey = pick("hands-free-hotkey") ?? settings.handsFreeHotkey;
+  settings.pasteLastHotkey = pick("paste-last-hotkey") ?? settings.pasteLastHotkey;
+  settings.mouseButton = pick("mouse-button") ?? settings.mouseButton;
+  settings.cleanupLevel = pick("cleanup-level") ?? settings.cleanupLevel;
+  settings.overlayStyle = pick("overlay-style") ?? settings.overlayStyle;
+  settings.overlayPosition = pick("overlay-position") ?? settings.overlayPosition;
+  const retention = pick("history-retention");
+  if (retention !== undefined) settings.historyRetentionDays = Number(retention);
+  settings.escapeCancels = checked("escape-cancels") ?? settings.escapeCancels;
+  settings.skipSilence = checked("skip-silence") ?? settings.skipSilence;
+  settings.muteOtherAudio = checked("mute-other-audio") ?? settings.muteOtherAudio;
+  settings.numbersAsDigits = checked("numbers-as-digits") ?? settings.numbersAsDigits;
+  settings.numberSymbols = checked("number-symbols") ?? settings.numberSymbols;
+  settings.spokenEmoji = checked("spoken-emoji") ?? settings.spokenEmoji;
+  settings.historyKeepAudio = checked("history-keep-audio") ?? settings.historyKeepAudio;
+  settings.readyPill = checked("ready-pill") ?? settings.readyPill;
 }
 
 async function persistSettings(silent = false, skipCollect = false) {
@@ -1156,8 +1804,13 @@ async function persistSettings(silent = false, skipCollect = false) {
       return;
     }
     syncSettingsControls();
+    // Some rows enable others (symbols need digits); redraw those pages.
+    if (view === "formatting" || view === "shortcuts") render();
     if (!silent) showToast("Settings saved");
   } catch (error) {
+    // Keep the window honest: show what was actually saved.
+    try { settings = await invoke<Settings>("get_settings"); } catch { /* keep local copy */ }
+    render();
     showToast(String(error));
   }
 }
@@ -1232,6 +1885,7 @@ async function openExternal(url: string) {
 function codeToHotkeyPart(code: string, key: string): string | null {
   const map: Record<string, string> = {
     Space: "Space",
+    F7: "F7",
     F8: "F8",
     F9: "F9",
     F10: "F10",
@@ -1249,26 +1903,31 @@ function codeToHotkeyPart(code: string, key: string): string | null {
   return null;
 }
 
-async function toggleHotkeyRecording() {
+async function toggleHotkeyRecording(target: CaptureTarget) {
   if (recordingHotkey) {
-    recordingHotkey = false;
-    showToast("Hotkey recording cancelled.");
+    const same = recordingHotkey === target;
+    recordingHotkey = null;
     try { await invoke("resume_hotkey_listener"); } catch { /* ignore */ }
-    render();
-    return;
+    if (same) {
+      showToast("Shortcut recording cancelled.");
+      render();
+      return;
+    }
   }
   try { await invoke("pause_hotkey_listener"); } catch { /* ignore */ }
-  recordingHotkey = true;
+  recordingHotkey = target;
   render();
 }
 
 function finishHotkeyCapture(spec: string, label: string) {
-  settings.hotkey = spec;
-  recordingHotkey = false;
+  const target = recordingHotkey ?? "hotkey";
+  settings[target] = spec;
+  recordingHotkey = null;
   void invoke("resume_hotkey_listener").catch(() => undefined);
   void persistSettings(true, true).then(() => {
     syncSettingsControls();
-    showToast(`Hotkey set to ${label}.`);
+    render();
+    if (settings[target] === spec) showToast(`Shortcut set to ${label}.`);
   });
 }
 
@@ -1277,8 +1936,8 @@ function onGlobalKeyDown(event: KeyboardEvent) {
   event.preventDefault();
   event.stopPropagation();
   if (event.key === "Escape") {
-    recordingHotkey = false;
-    showToast("Hotkey recording cancelled.");
+    recordingHotkey = null;
+    showToast("Shortcut recording cancelled.");
     void invoke("resume_hotkey_listener").catch(() => undefined);
     render();
     return;
@@ -1387,12 +2046,175 @@ async function clearLogs() {
 }
 async function dismissWelcome() {
   try {
+    const login = document.querySelector<HTMLInputElement>("#onboarding-login");
+    if (login && login.checked !== settings.launchAtLogin) {
+      settings.launchAtLogin = login.checked;
+      await persistSettings(true, true);
+    }
     await invoke("dismiss_welcome");
     settings.welcomeDismissed = true;
+    onboardingStep = 0;
   } catch (error) {
     showToast(String(error));
   }
   render();
+}
+
+async function refreshStats() {
+  try { stats = await invoke<StatsSummary>("get_stats"); } catch { stats = null; }
+}
+
+function historyId(button: HTMLElement, key: string) {
+  return Number(button.dataset[key]);
+}
+
+function bindPageActions() {
+  document.querySelectorAll<HTMLButtonElement>("[data-copy-history]").forEach(button => button.addEventListener("click", async () => {
+    const entry = history.find(item => item.id === historyId(button, "copyHistory"));
+    if (!entry?.text) return;
+    try { await invoke("copy_text", { text: entry.text }); showToast("Copied."); } catch (error) { showToast(String(error)); }
+  }));
+  document.querySelectorAll<HTMLButtonElement>("[data-play-history]").forEach(button => button.addEventListener("click", async () => {
+    const id = historyId(button, "playHistory");
+    try {
+      if (playingId === id) {
+        await invoke("stop_history_audio");
+        playingId = null;
+      } else {
+        await invoke("play_history_audio", { id });
+        playingId = id;
+        const entry = history.find(item => item.id === id);
+        const length = Math.max(1000, entry?.durationMs ?? 5000);
+        window.setTimeout(() => { if (playingId === id) { playingId = null; render(); } }, length + 300);
+      }
+    } catch (error) { playingId = null; showToast(String(error)); }
+    render();
+  }));
+  document.querySelectorAll<HTMLButtonElement>("[data-retry-history]").forEach(button => button.addEventListener("click", async () => {
+    const id = historyId(button, "retryHistory");
+    retrying.add(id);
+    render();
+    try {
+      const text = await invoke<string>("retry_history_entry", { id });
+      showToast(text ? "Retried with the current model." : "No speech was recognized.");
+    } catch (error) { showToast(String(error)); }
+    retrying.delete(id);
+    await refreshHistory().catch(() => undefined);
+    render();
+  }));
+  document.querySelectorAll<HTMLButtonElement>("[data-delete-history]").forEach(button => button.addEventListener("click", async () => {
+    const id = historyId(button, "deleteHistory");
+    try {
+      await invoke("delete_history_entry", { id });
+      if (playingId === id) playingId = null;
+      history = history.filter(item => item.id !== id);
+    } catch (error) { showToast(String(error)); }
+    render();
+  }));
+  document.querySelector("#reset-stats")?.addEventListener("click", async () => {
+    if (!window.confirm("Reset all stats on this PC? History is not affected.")) return;
+    try { await invoke("reset_stats"); await refreshStats(); showToast("Stats reset."); } catch (error) { showToast(String(error)); }
+    render();
+  });
+  document.querySelector("#add-replacement")?.addEventListener("click", () => {
+    const heard = document.querySelector<HTMLInputElement>("#replacement-heard")?.value.trim() ?? "";
+    const replacement = document.querySelector<HTMLInputElement>("#replacement-to")?.value.trim() ?? "";
+    if (!heard || !replacement) { showToast("Fill in what is heard and what to type."); return; }
+    settings.replacements = [...settings.replacements, { heard, replacement }];
+    void persistSettings(true, true).then(render);
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-remove-replacement]").forEach(button => button.addEventListener("click", () => {
+    const index = Number(button.dataset.removeReplacement);
+    settings.replacements = settings.replacements.filter((_, position) => position !== index);
+    void persistSettings(true, true).then(render);
+  }));
+  document.querySelector("#add-snippet")?.addEventListener("click", () => {
+    const trigger = document.querySelector<HTMLInputElement>("#snippet-trigger")?.value.trim() ?? "";
+    const expansion = document.querySelector<HTMLTextAreaElement>("#snippet-expansion")?.value ?? "";
+    if (!trigger || !expansion.trim()) { showToast("Fill in the trigger and the text to type."); return; }
+    settings.snippets = [...settings.snippets, { trigger, expansion }];
+    void persistSettings(true, true).then(render);
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-remove-snippet]").forEach(button => button.addEventListener("click", () => {
+    const index = Number(button.dataset.removeSnippet);
+    settings.snippets = settings.snippets.filter((_, position) => position !== index);
+    void persistSettings(true, true).then(render);
+  }));
+  const tryInput = document.querySelector<HTMLTextAreaElement>("#try-input");
+  tryInput?.addEventListener("input", () => { tryText = tryInput.value; });
+  document.querySelector("#try-run")?.addEventListener("click", async () => {
+    try { tryResult = (await invoke<string>("preview_text", { text: tryText })) || "(nothing would be typed)"; } catch (error) { tryResult = String(error); }
+    render();
+  });
+  document.querySelector("#export-settings")?.addEventListener("click", async () => {
+    try { const path = await invoke<string>("export_settings"); showToast(`Saved to ${path}`); } catch (error) { showToast(String(error)); }
+  });
+  const importFile = document.querySelector<HTMLInputElement>("#import-file");
+  document.querySelector("#import-settings")?.addEventListener("click", () => importFile?.click());
+  importFile?.addEventListener("change", async () => {
+    const file = importFile.files?.[0];
+    if (!file) return;
+    try {
+      const contents = await file.text();
+      settings = await invoke<Settings>("parse_settings_backup", { contents });
+      await persistSettings(true, true);
+      showToast("Settings imported.");
+    } catch (error) { showToast(String(error)); }
+    render();
+  });
+  document.querySelector("#run-setup")?.addEventListener("click", async () => {
+    settings.welcomeDismissed = false;
+    onboardingStep = 0;
+    onboardingTryText = "";
+    await persistSettings(true, true);
+    render();
+  });
+}
+
+function bindOnboarding() {
+  document.querySelector("#onboarding-skip")?.addEventListener("click", dismissWelcome);
+  document.querySelectorAll<HTMLButtonElement>("[data-onboarding-next]").forEach(button => button.addEventListener("click", async () => {
+    if (onboardingStep === 1) {
+      const language = document.querySelector<HTMLSelectElement>("#onboarding-language")?.value;
+      if (language && language !== settings.language) {
+        settings.language = language;
+        await persistSettings(true, true);
+      }
+    }
+    onboardingStep = Math.min(ONBOARDING_STEPS.length - 1, onboardingStep + 1);
+    render();
+    if (onboardingStep === 3) document.querySelector<HTMLTextAreaElement>("#onboarding-try")?.focus();
+  }));
+  document.querySelectorAll<HTMLButtonElement>("[data-onboarding-back]").forEach(button => button.addEventListener("click", () => {
+    onboardingStep = Math.max(0, onboardingStep - 1);
+    render();
+  }));
+  document.querySelectorAll<HTMLInputElement>('input[name="onboarding-model"]').forEach(radio => radio.addEventListener("change", () => {
+    onboardingModel = radio.value;
+    render();
+  }));
+  document.querySelector("#onboarding-model-go")?.addEventListener("click", async () => {
+    const id = onboardingModel;
+    if (!id) return;
+    if (!statuses[id]?.installed) {
+      await downloadModel(id);
+      if (!statuses[id]?.installed) return;
+    }
+    await selectModel(id);
+    onboardingStep = 3;
+    render();
+    document.querySelector<HTMLTextAreaElement>("#onboarding-try")?.focus();
+  });
+  const tryBox = document.querySelector<HTMLTextAreaElement>("#onboarding-try");
+  tryBox?.addEventListener("input", () => {
+    const hadText = !!onboardingTryText.trim();
+    onboardingTryText = tryBox.value;
+    // The first words turn "Skip for now" into "Next".
+    if (hadText !== !!onboardingTryText.trim()) {
+      const next = document.querySelector<HTMLButtonElement>("[data-onboarding-next]");
+      if (next) next.textContent = onboardingTryText.trim() ? "Next" : "Skip for now";
+    }
+  });
 }
 async function downloadModel(id: string) {
   try {
@@ -1516,15 +2338,41 @@ async function testDictation() {
 window.addEventListener("keydown", onGlobalKeyDown, true);
 window.addEventListener("keyup", onGlobalKeyUp, true);
 
+/** While the setup guide's "Try it" box is up, dictation types into it; a
+ *  full redraw mid-typing would drop keystrokes, so only the note updates. */
+function paintOnboardingNote() {
+  const note = document.querySelector(".onboarding-note");
+  if (note) note.textContent = recording ? "Listening…" : "It works the same in any app: the text goes where the caret is.";
+  paintSidebarStatus();
+}
+
 listen<boolean>("recording-changed", event => {
   recording = event.payload;
   if (!event.payload) testListening = false;
+  if (onboardingTrying()) {
+    paintOnboardingNote();
+    void refreshRuntime();
+    return;
+  }
   refreshRuntime().then(render).catch(() => render());
 }).catch(() => undefined);
 listen<string>("dictation-finished", async () => {
   recording = false;
   await refreshHistory().catch(() => undefined);
   await refreshRuntime().catch(() => undefined);
+  if (onboardingTrying()) {
+    paintOnboardingNote();
+    return;
+  }
+  if (view === "stats") await refreshStats();
+  render();
+}).catch(() => undefined);
+listen("dictation-cancelled", () => {
+  if (!onboardingTrying()) showToast("Cancelled. Nothing was typed.");
+}).catch(() => undefined);
+listen("history-changed", async () => {
+  if (view !== "history" || onboardingTrying()) return;
+  await refreshHistory().catch(() => undefined);
   render();
 }).catch(() => undefined);
 listen<string>("test-dictation-finished", async event => {
@@ -1548,9 +2396,7 @@ listen<Settings>("settings-changed", event => {
   render();
 }).catch(() => undefined);
 listen<string>("navigate", event => {
-  if (event.payload === "settings" || event.payload === "models" || event.payload === "history" || event.payload === "dictation" || event.payload === "debug" || event.payload === "about") {
-    openView(event.payload);
-  }
+  if (ALL_VIEWS.includes(event.payload as View)) openView(event.payload as View);
 }).catch(() => undefined);
 listen<LogLine>("log-line", event => {
   const line = event.payload;
@@ -1590,6 +2436,23 @@ Promise.all([
     debugLogging: saved.debugLogging ?? false,
     customVocabulary: saved.customVocabulary ?? "",
     copyToClipboard: saved.copyToClipboard ?? false,
+    cleanupLevel: saved.cleanupLevel ?? "medium",
+    numbersAsDigits: saved.numbersAsDigits ?? false,
+    numberSymbols: saved.numberSymbols ?? false,
+    spokenEmoji: saved.spokenEmoji ?? false,
+    replacements: saved.replacements ?? [],
+    snippets: saved.snippets ?? [],
+    escapeCancels: saved.escapeCancels ?? true,
+    handsFreeHotkey: saved.handsFreeHotkey ?? "",
+    pasteLastHotkey: saved.pasteLastHotkey ?? "",
+    mouseButton: saved.mouseButton ?? "",
+    overlayStyle: saved.overlayStyle ?? "minimal",
+    overlayPosition: saved.overlayPosition ?? "bottom",
+    readyPill: saved.readyPill ?? true,
+    skipSilence: saved.skipSilence ?? true,
+    muteOtherAudio: saved.muteOtherAudio ?? false,
+    historyRetentionDays: saved.historyRetentionDays ?? 30,
+    historyKeepAudio: saved.historyKeepAudio ?? true,
   };
   statuses = installs;
   history = entries;

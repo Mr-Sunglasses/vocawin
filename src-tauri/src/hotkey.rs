@@ -39,9 +39,18 @@ pub const VK_LCONTROL: u32 = 0xA2;
 pub const VK_RCONTROL: u32 = 0xA3;
 pub const VK_LMENU: u32 = 0xA4;
 pub const VK_RMENU: u32 = 0xA5;
+pub const VK_F7: u32 = 0x76;
 pub const VK_F8: u32 = 0x77;
 pub const VK_F9: u32 = 0x78;
 pub const VK_F10: u32 = 0x79;
+
+/// Side-specific or generic Ctrl, Alt, or Shift.
+pub fn is_modifier_vk(vk: u32) -> bool {
+    matches!(
+        vk,
+        0x10 | 0x11 | 0x12 | VK_LSHIFT | VK_RSHIFT | VK_LCONTROL | VK_RCONTROL | VK_LMENU | VK_RMENU
+    )
+}
 
 pub fn parse_hotkey(spec: &str) -> Result<HotkeySpec, String> {
     let trimmed = spec.trim();
@@ -61,6 +70,7 @@ pub fn parse_hotkey(spec: &str) -> Result<HotkeySpec, String> {
         "AltLeft" | "Left Alt" | "LAlt" => Ok(HotkeySpec::Lone { vk: VK_LMENU }),
         "ShiftRight" | "Right Shift" | "RShift" => Ok(HotkeySpec::Lone { vk: VK_RSHIFT }),
         "ShiftLeft" | "Left Shift" | "LShift" => Ok(HotkeySpec::Lone { vk: VK_LSHIFT }),
+        "F7" => Ok(HotkeySpec::Lone { vk: VK_F7 }),
         "F8" => Ok(HotkeySpec::Lone { vk: VK_F8 }),
         "F9" => Ok(HotkeySpec::Lone { vk: VK_F9 }),
         "F10" => Ok(HotkeySpec::Lone { vk: VK_F10 }),
@@ -93,6 +103,7 @@ fn parse_combo(spec: &str) -> Result<HotkeySpec, String> {
                 );
             }
             "space" => key = Some(VK_SPACE),
+            "f7" => key = Some(VK_F7),
             "f8" => key = Some(VK_F8),
             "f9" => key = Some(VK_F9),
             "f10" => key = Some(VK_F10),
@@ -173,6 +184,7 @@ fn lone_id(vk: u32) -> Option<String> {
             VK_LMENU => "AltLeft",
             VK_RSHIFT => "ShiftRight",
             VK_LSHIFT => "ShiftLeft",
+            VK_F7 => "F7",
             VK_F8 => "F8",
             VK_F9 => "F9",
             VK_F10 => "F10",
@@ -186,6 +198,7 @@ fn lone_id(vk: u32) -> Option<String> {
 fn key_token(vk: u32) -> String {
     match vk {
         VK_SPACE => "Space".into(),
+        VK_F7 => "F7".into(),
         VK_F8 => "F8".into(),
         VK_F9 => "F9".into(),
         VK_F10 => "F10".into(),
