@@ -974,6 +974,7 @@ fn apply_ready_or_parked_tray(app: &AppHandle) {
 #[cfg(windows)]
 fn finish_captured_audio(app: &AppHandle, samples: Vec<f32>, sample_rate: u32) {
     let state = app.state::<AppState>();
+    let session = state.session_id.load(Ordering::SeqCst);
     set_recording_flag(&state, false);
     let _ = app.emit("recording-changed", false);
     let sound = state
@@ -983,7 +984,7 @@ fn finish_captured_audio(app: &AppHandle, samples: Vec<f32>, sample_rate: u32) {
         .unwrap_or_else(|_| "voca".into());
     sounds::play_if_enabled(&sound, false);
     let inject = session_injects(&state);
-    match complete_take(app, samples, sample_rate, true) {
+    match complete_take(app, samples, sample_rate, true, session) {
         Ok(text) => {
             let event = if inject {
                 "dictation-finished"
@@ -1019,6 +1020,7 @@ fn complete_take(
     samples: Vec<f32>,
     sample_rate: u32,
     type_it: bool,
+    session: u64,
 ) -> Result<String, String> {
     let state = app.state::<AppState>();
     let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
@@ -1029,14 +1031,11 @@ fn complete_take(
     if inject {
         overlay::show(app, overlay::Phase::Processing, overlay_on(&settings));
     }
-    let generation = state.session_generation.load(Ordering::SeqCst);
     let result = transcribe_samples(&state, samples, sample_rate);
     state.processing.store(false, Ordering::SeqCst);
     let recording_again = *state.recording.lock().unwrap_or_else(|e| e.into_inner());
-    if !recording_again {
-        hook::set_cancel_armed(false);
-    }
-    let cancelled = state.cancel_generation.load(Ordering::SeqCst) != generation;
+    hook::disarm_cancel_for(session);
+    let cancelled = state.cancelled_session.load(Ordering::SeqCst) == session;
     let outcome = match result {
         Ok(take) if cancelled => {
             if let Some(id) = take.history_id {
@@ -1086,7 +1085,7 @@ fn complete_take(
 fn release_session_chrome(app: &AppHandle) {
     let state = app.state::<AppState>();
     state.ducker.restore();
-    hook::set_cancel_armed(false);
+    hook::disarm_cancel_for(state.session_id.load(Ordering::SeqCst));
     if session_injects(&state) {
         overlay::hide(app);
     }
@@ -1129,9 +1128,10 @@ struct AppState {
     session_trigger: Mutex<Trigger>,
     /// True while a finished take is being transcribed.
     processing: AtomicBool,
-    /// Bumped by Escape; a take started before the bump is not typed.
-    cancel_generation: AtomicU64,
-    session_generation: AtomicU64,
+    /// Id of the newest take, bumped when one starts.
+    session_id: AtomicU64,
+    /// Id of the take Escape cancelled; that take is not typed.
+    cancelled_session: AtomicU64,
     /// For paste-last; kept even when history is off.
     last_dictation: Mutex<String>,
     /// A take the VocaWin window will type itself: counted in stats when
@@ -2318,10 +2318,7 @@ fn begin_voice_session(
     }
     state.session_opening.store(true, Ordering::SeqCst);
     state.release_during_open.store(false, Ordering::SeqCst);
-    state.session_generation.store(
-        state.cancel_generation.load(Ordering::SeqCst),
-        Ordering::SeqCst,
-    );
+    let session = state.session_id.fetch_add(1, Ordering::SeqCst) + 1;
     if let Err(error) = state.recorder.start(
         settings.silence_seconds,
         settings.max_recording_seconds,
@@ -2340,7 +2337,7 @@ fn begin_voice_session(
     set_recording_flag(&state, recording_after_start_attempt(true));
     state.session_opening.store(false, Ordering::SeqCst);
     if settings.escape_cancels {
-        hook::set_cancel_armed(true);
+        hook::set_cancel_armed(Some(session));
     }
     if settings.mute_other_audio {
         state.ducker.mute_others();
@@ -2615,12 +2612,13 @@ fn finish_voice_session(handle: &AppHandle) {
     let state = handle.state::<AppState>();
     let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
     let inject = session_injects(&state);
+    let session = state.session_id.load(Ordering::SeqCst);
     let captured = stop_capture(&state);
     let _ = handle.emit("recording-changed", false);
     let result = match captured {
         Ok(Some((samples, sample_rate))) => {
             sounds::play_if_enabled(&settings.sound_theme, false);
-            complete_take(handle, samples, sample_rate, true)
+            complete_take(handle, samples, sample_rate, true, session)
         }
         Ok(None) => {
             release_session_chrome(handle);
@@ -2658,12 +2656,13 @@ async fn stop_and_transcribe(app: AppHandle) -> Result<String, String> {
             .lock()
             .map(|settings| settings.sound_theme.clone())
             .unwrap_or_else(|_| "voca".into());
+        let session = state.session_id.load(Ordering::SeqCst);
         let captured = stop_capture(&state);
         let _ = app.emit("recording-changed", false);
         let result = match captured {
             Ok(Some((samples, sample_rate))) => {
                 sounds::play_if_enabled(&sound, false);
-                complete_take(&app, samples, sample_rate, false)
+                complete_take(&app, samples, sample_rate, false, session)
             }
             Ok(None) => {
                 release_session_chrome(&app);
@@ -2683,12 +2682,18 @@ async fn stop_and_transcribe(app: AppHandle) -> Result<String, String> {
     .map_err(|error| format!("Stop dictation was cancelled: {error}"))?
 }
 
-/// Escape: throw the take away. While recording the audio is discarded;
-/// while transcribing, the result is kept in History but not typed.
-fn cancel_voice_session(app: &AppHandle) {
+/// Escape: throw take `session` away. While recording the audio is
+/// discarded; while transcribing, the result is kept in History but not
+/// typed. An Escape for an older take (handled after a new one started) is
+/// ignored, so it can never discard the take after it.
+fn cancel_voice_session(app: &AppHandle, session: u64) {
     let state = app.state::<AppState>();
-    state.cancel_generation.fetch_add(1, Ordering::SeqCst);
-    hook::set_cancel_armed(false);
+    if !is_current_session(state.session_id.load(Ordering::SeqCst), session) {
+        logbuf::debug("Escape for an earlier take ignored.");
+        return;
+    }
+    state.cancelled_session.store(session, Ordering::SeqCst);
+    hook::disarm_cancel_for(session);
     let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
     let recording = *state.recording.lock().unwrap_or_else(|e| e.into_inner())
         || state.session_opening.load(Ordering::SeqCst)
@@ -2705,6 +2710,10 @@ fn cancel_voice_session(app: &AppHandle) {
     }
     overlay::show(app, overlay::Phase::Cancelled, overlay_on(&settings));
     let _ = app.emit("dictation-cancelled", ());
+}
+
+fn is_current_session(current: u64, cancelled: u64) -> bool {
+    cancelled != 0 && cancelled == current
 }
 
 /// Type the last dictation again. Waits for the shortcut's modifiers to come
@@ -3205,8 +3214,8 @@ pub fn run() {
                 whisper_cache,
                 session_trigger: Mutex::new(Trigger::default()),
                 processing: AtomicBool::new(false),
-                cancel_generation: AtomicU64::new(0),
-                session_generation: AtomicU64::new(0),
+                session_id: AtomicU64::new(0),
+                cancelled_session: AtomicU64::new(0),
                 last_dictation: Mutex::new(String::new()),
                 pending_window_take: Mutex::new(None),
                 ducker: ducking::Ducker::new(),
@@ -3433,7 +3442,7 @@ pub(crate) fn on_hotkey_event(handle: &AppHandle, event: hook::HookEvent) {
         hook::HookEvent::HandsFree if !paused => press(handle, &settings, Trigger::HandsFree),
         hook::HookEvent::Released => release(handle, toggle, hotkey_trigger),
         hook::HookEvent::MouseUp => release(handle, toggle, Trigger::Mouse),
-        hook::HookEvent::Cancel => cancel_voice_session(handle),
+        hook::HookEvent::Cancel(session) => cancel_voice_session(handle, session),
         hook::HookEvent::PasteLast if !paused => paste_last(handle),
         _ => {}
     }
@@ -3522,7 +3531,7 @@ fn start_auto_pause_watcher(app: AppHandle) {
                 drop(paused);
                 hook::set_dictation_paused(true);
                 hook::clear_held_vk();
-                hook::set_cancel_armed(false);
+                hook::set_cancel_armed(None);
                 abandon_voice_session(&state);
                 overlay::hide(&app);
                 let _ = app.emit("recording-changed", false);
@@ -4467,6 +4476,14 @@ mod tests {
             format_transcript(&settings, "um push twenty three commits to get hub, party emoji"),
             "Push 23 commits to GitHub, 🎉 "
         );
+    }
+
+    #[test]
+    fn escape_only_cancels_the_take_it_was_pressed_during() {
+        assert!(is_current_session(4, 4));
+        // Take 5 started before Escape for take 4 was handled: leave it.
+        assert!(!is_current_session(5, 4));
+        assert!(!is_current_session(0, 0));
     }
 
     #[test]

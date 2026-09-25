@@ -60,8 +60,9 @@ pub const DEFAULT_SAFETY_TIMEOUT: Duration = Duration::from_secs(65);
 pub enum HookEvent {
     Pressed,
     Released,
-    /// Escape while a dictation is armed for cancel.
-    Cancel,
+    /// Escape while a dictation is armed for cancel, with that take's id,
+    /// so a late Escape can never throw away the take after it.
+    Cancel(u64),
     /// Hands-free shortcut: start, or stop a running session.
     HandsFree,
     /// Type the last dictation again.
@@ -151,8 +152,8 @@ struct HookShared {
     actions: Vec<(HotkeySpec, HookEvent)>,
     /// Keys of actions that fired and are still down (their up is eaten).
     latched: Vec<u32>,
-    /// Escape cancels while a dictation records or transcribes.
-    cancel_armed: bool,
+    /// The take Escape cancels while it records or transcribes, if any.
+    cancel_armed: Option<u64>,
     escape_swallowed: bool,
     mouse_button: Option<MouseButton>,
     mouse_held: bool,
@@ -182,7 +183,7 @@ fn shared() -> &'static Mutex<HookShared> {
             safety_timeout: DEFAULT_SAFETY_TIMEOUT,
             actions: Vec::new(),
             latched: Vec::new(),
-            cancel_armed: false,
+            cancel_armed: None,
             escape_swallowed: false,
             mouse_button: None,
             mouse_held: false,
@@ -270,11 +271,21 @@ pub fn set_action_bindings(actions: Vec<(HotkeySpec, HookEvent)>) {
     guard.latched.clear();
 }
 
-/// Arm Escape while a dictation records or transcribes. Disarming leaves an
-/// Escape that is already down swallowed until it comes up.
-pub fn set_cancel_armed(armed: bool) {
+/// Arm Escape for take `session` while it records or transcribes, or disarm
+/// with `None`. Disarming leaves an Escape that is already down swallowed
+/// until it comes up.
+pub fn set_cancel_armed(session: Option<u64>) {
     let mut guard = shared().lock().unwrap_or_else(|e| e.into_inner());
-    guard.cancel_armed = armed;
+    guard.cancel_armed = session;
+}
+
+/// Disarm Escape only if it is still armed for `session`: a newer take may
+/// have armed it for itself meanwhile.
+pub fn disarm_cancel_for(session: u64) {
+    let mut guard = shared().lock().unwrap_or_else(|e| e.into_inner());
+    if guard.cancel_armed == Some(session) {
+        guard.cancel_armed = None;
+    }
 }
 
 /// Bind a mouse button, or `None` to release it and remove the mouse hook.
@@ -315,10 +326,10 @@ fn escape_action(
     }
     match edge {
         KeyEdge::Down if guard.escape_swallowed => SpecialAction::Swallow,
-        KeyEdge::Down if guard.cancel_armed && !guard.capture_paused => {
+        KeyEdge::Down if guard.cancel_armed.is_some() && !guard.capture_paused => {
             guard.escape_swallowed = true;
-            guard.cancel_armed = false;
-            SpecialAction::Emit(HookEvent::Cancel)
+            let session = guard.cancel_armed.take().unwrap_or_default();
+            SpecialAction::Emit(HookEvent::Cancel(session))
         }
         KeyEdge::Up if guard.escape_swallowed => {
             guard.escape_swallowed = false;
@@ -393,7 +404,7 @@ fn mouse_action(guard: &mut HookShared, button: MouseButton, down: bool) -> Spec
 fn emit(event: HookEvent) {
     // Cancel must not wait behind the actor: it may be busy transcribing the
     // take Escape is meant to stop, and would only see Cancel after typing.
-    if event == HookEvent::Cancel {
+    if let HookEvent::Cancel(_) = event {
         let app = shared()
             .lock()
             .map(|guard| guard.app.clone())
@@ -401,7 +412,7 @@ fn emit(event: HookEvent) {
         if let Some(app) = app {
             let _ = std::thread::Builder::new()
                 .name("vocawin-cancel".into())
-                .spawn(move || crate::on_hotkey_event(&app, HookEvent::Cancel));
+                .spawn(move || crate::on_hotkey_event(&app, event));
         }
         return;
     }
@@ -1034,7 +1045,7 @@ mod tests {
             safety_timeout: DEFAULT_SAFETY_TIMEOUT,
             actions: Vec::new(),
             latched: Vec::new(),
-            cancel_armed: false,
+            cancel_armed: None,
             escape_swallowed: false,
             mouse_button: None,
             mouse_held: false,
@@ -1051,10 +1062,10 @@ mod tests {
     #[test]
     fn armed_escape_cancels_once_and_eats_its_up() {
         let mut shared = test_shared();
-        shared.cancel_armed = true;
+        shared.cancel_armed = Some(7);
         assert_eq!(
             escape_action(&mut shared, VK_ESCAPE, KeyEdge::Down),
-            SpecialAction::Emit(HookEvent::Cancel)
+            SpecialAction::Emit(HookEvent::Cancel(7))
         );
         // Typematic repeats and the up are eaten; nothing fires twice.
         assert_eq!(escape_action(&mut shared, VK_ESCAPE, KeyEdge::Down), SpecialAction::Swallow);
@@ -1066,7 +1077,7 @@ mod tests {
     #[test]
     fn escape_is_left_alone_while_recording_a_hotkey() {
         let mut shared = test_shared();
-        shared.cancel_armed = true;
+        shared.cancel_armed = Some(7);
         shared.capture_paused = true;
         assert_eq!(escape_action(&mut shared, VK_ESCAPE, KeyEdge::Down), SpecialAction::Pass);
     }
