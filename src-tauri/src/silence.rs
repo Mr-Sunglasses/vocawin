@@ -46,6 +46,32 @@ fn seconds(value: f32) -> usize {
     (value * SAMPLE_RATE as f32) as usize
 }
 
+/// RMS of each 30 ms frame of 16 kHz mono samples.
+pub fn frame_rms(samples: &[f32]) -> Vec<f32> {
+    samples
+        .chunks(FRAME)
+        .map(|frame| (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt())
+        .collect()
+}
+
+/// Frame RMS below which a take's frame is silence: a few times the take's
+/// own noise floor. `chunking` uses the same line to decide what audio it
+/// may leave out, so it never drops anything this module would keep.
+pub fn speech_threshold(frame_rms: &[f32]) -> f32 {
+    if frame_rms.is_empty() {
+        return MINIMUM_THRESHOLD;
+    }
+    let mut sorted = frame_rms.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let floor = sorted[sorted.len() / 20];
+    let loudest = sorted[sorted.len() - 1];
+    // Never demand more than a fraction of the loudest frame, so a take with
+    // little silence to measure does not lose its quieter words.
+    (floor * FLOOR_RATIO)
+        .max(MINIMUM_THRESHOLD)
+        .min(loudest * LOUDEST_RATIO)
+}
+
 /// Decide what to decode from 16 kHz mono samples.
 pub fn decide(samples: &[f32]) -> Decision {
     if samples.is_empty() {
@@ -55,19 +81,8 @@ pub fn decide(samples: &[f32]) -> Decision {
     if peak < NO_SIGNAL_PEAK {
         return Decision::NoSpeech;
     }
-    let energies: Vec<f32> = samples
-        .chunks(FRAME)
-        .map(|frame| (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt())
-        .collect();
-    let mut sorted = energies.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let floor = sorted[sorted.len() / 20];
-    let loudest = sorted[sorted.len() - 1];
-    // Never demand more than a fraction of the loudest frame, so a take with
-    // little silence to measure does not lose its quieter words.
-    let threshold = (floor * FLOOR_RATIO)
-        .max(MINIMUM_THRESHOLD)
-        .min(loudest * LOUDEST_RATIO);
+    let energies = frame_rms(samples);
+    let threshold = speech_threshold(&energies);
 
     // Frames over the threshold, merged across short pauses.
     let mut stretches: Vec<Range<usize>> = Vec::new();
