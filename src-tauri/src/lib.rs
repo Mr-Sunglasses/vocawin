@@ -427,6 +427,8 @@ enum AudioCommand {
         silence_auto_stop: bool,
         /// Level meter only: no silence auto-stop and no transcription handoff.
         meter_only: bool,
+        /// The take's id, handed back with its audio when it auto-stops.
+        session: u64,
         reply: mpsc::Sender<Result<(), String>>,
     },
     Stop {
@@ -636,6 +638,7 @@ fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
     let mut max_seconds = 60.0_f32;
     let mut meter_only = false;
     let mut silence_auto_stop = false;
+    let mut current_session = 0_u64;
 
     loop {
         let timed_out = match commands.recv_timeout(std::time::Duration::from_millis(100)) {
@@ -647,6 +650,7 @@ fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
                         device_name,
                         silence_auto_stop: enable_silence,
                         meter_only: meter,
+                        session,
                         reply,
                     } => {
                         meter_only = meter_only_after_start(stream.is_some(), meter, meter_only);
@@ -656,6 +660,7 @@ fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
                             silence_seconds = silence.clamp(0.3, 10.0);
                             max_seconds = max.clamp(3.0, 300.0);
                             silence_auto_stop = enable_silence;
+                            current_session = session;
                             match open_input_stream(
                                 Arc::clone(&samples),
                                 Arc::clone(&last_voice_ms),
@@ -729,8 +734,9 @@ fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
                 match take_recording(&mut stream, &mut sample_rate, &mut started_ms, &samples) {
                     Ok((pcm, rate)) => {
                         let app_for_finish = app.clone();
+                        let session = current_session;
                         std::thread::spawn(move || {
-                            finish_captured_audio(&app_for_finish, pcm, rate);
+                            finish_captured_audio(&app_for_finish, pcm, rate, session);
                         });
                     }
                     Err(_) => {
@@ -785,6 +791,7 @@ impl AudioRecorder {
         max_seconds: f32,
         device_name: String,
         silence_auto_stop: bool,
+        session: u64,
     ) -> Result<(), String> {
         let (reply, response) = mpsc::channel();
         self.commands
@@ -794,6 +801,7 @@ impl AudioRecorder {
                 device_name,
                 silence_auto_stop,
                 meter_only: false,
+                session,
                 reply,
             })
             .map_err(|_| "Audio thread is not running".to_string())?;
@@ -818,6 +826,7 @@ impl AudioRecorder {
                 device_name,
                 silence_auto_stop: false,
                 meter_only: true,
+                session: 0,
                 reply,
             })
             .map_err(|_| "Audio thread is not running".to_string())?;
@@ -871,7 +880,7 @@ impl AudioRecorder {
     fn new(_: AppHandle) -> Self {
         Self
     }
-    fn start(&self, _: f32, _: f32, _: String, _: bool) -> Result<(), String> {
+    fn start(&self, _: f32, _: f32, _: String, _: bool, _: u64) -> Result<(), String> {
         Err("Microphone capture is available in Windows builds only.".into())
     }
     fn start_meter(&self, _: String) -> Result<(), String> {
@@ -972,9 +981,11 @@ fn apply_ready_or_parked_tray(app: &AppHandle) {
 
 /// Silence or the max-recording limit ended the take on the audio thread.
 #[cfg(windows)]
-fn finish_captured_audio(app: &AppHandle, samples: Vec<f32>, sample_rate: u32) {
+/// `session` is the id the take was started with, carried from the audio
+/// thread: another take may have started by the time this runs.
+fn finish_captured_audio(app: &AppHandle, samples: Vec<f32>, sample_rate: u32, session: u64) {
     let state = app.state::<AppState>();
-    let session = state.session_id.load(Ordering::SeqCst);
+    state.processing.store(true, Ordering::SeqCst);
     set_recording_flag(&state, false);
     let _ = app.emit("recording-changed", false);
     let sound = state
@@ -1035,7 +1046,7 @@ fn complete_take(
     state.processing.store(false, Ordering::SeqCst);
     let recording_again = *state.recording.lock().unwrap_or_else(|e| e.into_inner());
     hook::disarm_cancel_for(session);
-    let cancelled = state.cancelled_session.load(Ordering::SeqCst) == session;
+    let cancelled = take_cancellation(&state, session);
     let outcome = match result {
         Ok(take) if cancelled => {
             if let Some(id) = take.history_id {
@@ -1085,6 +1096,7 @@ fn complete_take(
 fn release_session_chrome(app: &AppHandle) {
     let state = app.state::<AppState>();
     state.ducker.restore();
+    state.processing.store(false, Ordering::SeqCst);
     hook::disarm_cancel_for(state.session_id.load(Ordering::SeqCst));
     if session_injects(&state) {
         overlay::hide(app);
@@ -1130,8 +1142,9 @@ struct AppState {
     processing: AtomicBool,
     /// Id of the newest take, bumped when one starts.
     session_id: AtomicU64,
-    /// Id of the take Escape cancelled; that take is not typed.
-    cancelled_session: AtomicU64,
+    /// Ids of takes Escape cancelled that have not finished yet; they are
+    /// not typed. Several can be in flight at once.
+    cancelled_sessions: Mutex<Vec<u64>>,
     /// For paste-last; kept even when history is off.
     last_dictation: Mutex<String>,
     /// A take the VocaWin window will type itself: counted in stats when
@@ -2324,6 +2337,7 @@ fn begin_voice_session(
         settings.max_recording_seconds,
         settings.input_device.clone(),
         silence_auto_stop,
+        session,
     ) {
         state.session_opening.store(false, Ordering::SeqCst);
         set_recording_flag(&state, recording_after_start_attempt(false));
@@ -2592,7 +2606,11 @@ fn stop_capture(state: &AppState) -> Result<Option<(Vec<f32>, u32)>, String> {
     state.session_opening.store(false, Ordering::SeqCst);
     state.release_during_open.store(false, Ordering::SeqCst);
     match stopped {
-        Ok((samples, sample_rate)) if !samples.is_empty() => Ok(Some((samples, sample_rate))),
+        Ok((samples, sample_rate)) if !samples.is_empty() => {
+            // From here Escape cancels the transcription, not the recording.
+            state.processing.store(true, Ordering::SeqCst);
+            Ok(Some((samples, sample_rate)))
+        }
         Ok(_) => Ok(None),
         Err(error) if is_stale_stop_error(&error) => Ok(None),
         Err(error) => Err(error),
@@ -2692,7 +2710,7 @@ fn cancel_voice_session(app: &AppHandle, session: u64) {
         logbuf::debug("Escape for an earlier take ignored.");
         return;
     }
-    state.cancelled_session.store(session, Ordering::SeqCst);
+    mark_cancelled(&state, session);
     hook::disarm_cancel_for(session);
     let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
     let recording = *state.recording.lock().unwrap_or_else(|e| e.into_inner())
@@ -2706,10 +2724,45 @@ fn cancel_voice_session(app: &AppHandle, session: u64) {
     } else if state.processing.load(Ordering::SeqCst) {
         logbuf::info_and_emit(app, "Transcription cancelled; nothing will be typed.");
     } else {
+        // Already typed: nothing left to stop.
+        take_cancellation(&state, session);
         return;
     }
     overlay::show(app, overlay::Phase::Cancelled, overlay_on(&settings));
     let _ = app.emit("dictation-cancelled", ());
+}
+
+/// Remember that take `session` was cancelled. Bounded: a take cancelled
+/// while recording never reaches `take_cancellation`.
+fn mark_cancelled(state: &AppState, session: u64) {
+    let mut cancelled = state
+        .cancelled_sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    remember_cancelled(&mut cancelled, session);
+}
+
+fn remember_cancelled(cancelled: &mut Vec<u64>, session: u64) {
+    if !cancelled.contains(&session) {
+        cancelled.push(session);
+    }
+    let excess = cancelled.len().saturating_sub(16);
+    cancelled.drain(..excess);
+}
+
+/// Whether take `session` was cancelled, forgetting it either way.
+fn take_cancellation(state: &AppState, session: u64) -> bool {
+    let mut cancelled = state
+        .cancelled_sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match cancelled.iter().position(|id| *id == session) {
+        Some(index) => {
+            cancelled.remove(index);
+            true
+        }
+        None => false,
+    }
 }
 
 fn is_current_session(current: u64, cancelled: u64) -> bool {
@@ -3215,7 +3268,7 @@ pub fn run() {
                 session_trigger: Mutex::new(Trigger::default()),
                 processing: AtomicBool::new(false),
                 session_id: AtomicU64::new(0),
-                cancelled_session: AtomicU64::new(0),
+                cancelled_sessions: Mutex::new(Vec::new()),
                 last_dictation: Mutex::new(String::new()),
                 pending_window_take: Mutex::new(None),
                 ducker: ducking::Ducker::new(),
@@ -4476,6 +4529,20 @@ mod tests {
             format_transcript(&settings, "um push twenty three commits to get hub, party emoji"),
             "Push 23 commits to GitHub, 🎉 "
         );
+    }
+
+    #[test]
+    fn cancellations_of_overlapping_takes_are_all_kept() {
+        let mut cancelled = Vec::new();
+        remember_cancelled(&mut cancelled, 4);
+        remember_cancelled(&mut cancelled, 5);
+        remember_cancelled(&mut cancelled, 5);
+        assert_eq!(cancelled, vec![4, 5]);
+        for session in 6..40 {
+            remember_cancelled(&mut cancelled, session);
+        }
+        assert_eq!(cancelled.len(), 16);
+        assert_eq!(cancelled.last(), Some(&39));
     }
 
     #[test]
