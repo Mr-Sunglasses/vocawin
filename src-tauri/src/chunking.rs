@@ -7,10 +7,12 @@
 //! `SEARCH_SECONDS`, cut in the quietest stretch near each even split, and
 //! the window texts are joined. GigaAM is split the same way because its
 //! encoder rejects very long takes. Parakeet and SenseVoice decode takes whole.
+//!
+//! Windows cover every sample. Deciding up front which audio is silence
+//! would sometimes drop quiet speech, so nothing is left out here; a window
+//! that decodes to nothing is decoded again from `speech_start` instead.
 
 use std::ops::Range;
-
-use crate::silence;
 
 const SAMPLE_RATE: usize = 16_000;
 /// 30 ms frames.
@@ -26,25 +28,23 @@ const QUIET_FRAMES: usize = 5;
 /// Frame energy (sum of squares) that always counts as quiet: 0.004 RMS,
 /// `silence.rs`'s lowest speech threshold.
 const QUIET_FLOOR: f32 = 0.004 * 0.004 * FRAME as f32;
-/// Audio is never left out above this RMS (-40 dBFS), even under the take's
-/// silence threshold: a take with no real silence has a noise floor that is
-/// its own quiet speech. Microphone noise sits well below this.
-const SKIP_CEILING: f32 = 0.01;
 /// Silence a window may open with. Moonshine returns nothing for a window
-/// that starts on a second or more of silence, so the next window starts
-/// just before its pause ends.
+/// that starts on a second or more of silence, so a cut goes near the end
+/// of its pause and the rest of the pause trails the previous window.
 const LEAD_SECONDS: f32 = 0.2;
+/// `speech_start` measures a window's opening level over this long, and
+/// only reports a lead-in at least this long.
+const OPENING_SECONDS: f32 = 0.5;
+/// Speech is this many times the opening's RMS (about 10 dB up).
+const SPEECH_OVER_OPENING: f32 = 3.0;
+/// Lowest RMS that counts as speech, `silence.rs`'s minimum.
+const MINIMUM_SPEECH_RMS: f32 = 0.004;
 
 fn seconds(value: f32) -> usize {
     (value * SAMPLE_RATE as f32) as usize
 }
 
-fn energy(frame: &[f32]) -> f32 {
-    frame.iter().map(|s| s * s).sum()
-}
-
-/// Sample ranges to decode in order. They cover the whole take except the
-/// middle of a pause too long to fit in one window's search range.
+/// Sample ranges to decode in order, covering all of `samples` without gaps.
 pub fn windows(samples: &[f32]) -> Vec<Range<usize>> {
     let total = samples.len();
     let window = seconds(WINDOW_SECONDS);
@@ -53,44 +53,31 @@ pub fn windows(samples: &[f32]) -> Vec<Range<usize>> {
     }
     let count = total.div_ceil(window);
     let search = seconds(SEARCH_SECONDS);
-    // Audio past a search range is left out only when `silence.rs` would
-    // call it silence too (near the take's own noise floor), and never above
-    // `SKIP_CEILING`.
-    let silent = silence::speech_threshold(&silence::frame_rms(samples)).min(SKIP_CEILING);
     let mut ranges = Vec::with_capacity(count);
     let mut start = 0;
     for index in 1..count {
         let even = total * index / count;
-        let lower = even.saturating_sub(search).max(start);
-        let upper = (even + search).min(total);
-        if upper < lower + QUIET_FRAMES * FRAME {
-            // A long pause already carried the window start past this split.
-            continue;
-        }
-        let (end, resume) = cut(samples, lower, upper, silent);
-        ranges.push(start..end);
-        start = resume;
+        let cut = cut_point(
+            samples,
+            even.saturating_sub(search),
+            (even + search).min(total),
+        );
+        ranges.push(start..cut);
+        start = cut;
     }
-    if start < total {
-        ranges.push(start..total);
-    }
+    ranges.push(start..total);
     ranges
 }
 
-/// Where one window ends and the next starts, searching `lower..upper`.
-///
-/// The cut goes in the pause holding the quietest `QUIET_FRAMES` run,
-/// `LEAD_SECONDS` before the pause ends. When that pause is silence (RMS
-/// under `silent`) and runs past `upper`, the window still ends by `upper`
-/// and the next one starts where the silence ends, so it is not decoded.
-fn cut(samples: &[f32], lower: usize, upper: usize, silent: f32) -> (usize, usize) {
+/// Where to cut inside `lower..upper`: the pause holding the quietest
+/// `QUIET_FRAMES` run, `LEAD_SECONDS` before the pause ends.
+fn cut_point(samples: &[f32], lower: usize, upper: usize) -> usize {
     let energies: Vec<f32> = samples[lower..upper]
         .chunks_exact(FRAME)
-        .map(energy)
+        .map(|frame| frame.iter().map(|s| s * s).sum::<f32>())
         .collect();
     if energies.len() < QUIET_FRAMES {
-        let middle = (lower + upper) / 2;
-        return (middle, middle);
+        return (lower + upper) / 2;
     }
     let mut best = 0;
     let mut best_energy = f32::MAX;
@@ -101,31 +88,36 @@ fn cut(samples: &[f32], lower: usize, upper: usize, silent: f32) -> (usize, usiz
             best = index;
         }
     }
-    let run_energy = best_energy / QUIET_FRAMES as f32;
-    let quiet = (run_energy * 4.0).max(QUIET_FLOOR);
+    let quiet = (best_energy / QUIET_FRAMES as f32 * 4.0).max(QUIET_FLOOR);
     let mut pause_end = best + QUIET_FRAMES;
     while pause_end < energies.len() && energies[pause_end] <= quiet {
         pause_end += 1;
     }
-    let mut pause_end = lower + pause_end * FRAME;
-    let silent_energy = silent * silent * FRAME as f32;
-    if run_energy < silent_energy && pause_end == lower + energies.len() * FRAME {
-        while pause_end + FRAME <= samples.len()
-            && energy(&samples[pause_end..pause_end + FRAME]) < silent_energy
-        {
-            pause_end += FRAME;
-        }
-        if pause_end + FRAME > samples.len() {
-            // Silence to the end of the take: nothing after it to decode.
-            pause_end = samples.len() + seconds(LEAD_SECONDS);
-        }
-    }
     let middle = lower + best * FRAME + QUIET_FRAMES * FRAME / 2;
-    let resume = pause_end
+    (lower + pause_end * FRAME)
         .saturating_sub(seconds(LEAD_SECONDS))
         .max(middle)
-        .min(samples.len());
-    (resume.min(upper), resume)
+}
+
+/// Where speech starts in a window that opens on a pause, `LEAD_SECONDS`
+/// early. The pause is measured from the window's own opening, so a noisy
+/// room counts as a pause as long as speech is clearly louder. `None` when
+/// the window opens on speech, has a lead-in shorter than `OPENING_SECONDS`,
+/// or has no speech.
+pub fn speech_start(samples: &[f32]) -> Option<usize> {
+    let rms: Vec<f32> = samples
+        .chunks(FRAME)
+        .map(|frame| (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt())
+        .collect();
+    let opening_frames = seconds(OPENING_SECONDS) / FRAME;
+    if rms.len() <= opening_frames {
+        return None;
+    }
+    let mut opening = rms[..opening_frames].to_vec();
+    opening.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let threshold = (opening[opening.len() / 2] * SPEECH_OVER_OPENING).max(MINIMUM_SPEECH_RMS);
+    let first = rms.iter().position(|value| *value >= threshold)?;
+    (first >= opening_frames).then(|| (first * FRAME).saturating_sub(seconds(LEAD_SECONDS)))
 }
 
 #[cfg(test)]
@@ -135,6 +127,12 @@ mod tests {
     fn tone(seconds_long: f32) -> Vec<f32> {
         (0..seconds(seconds_long))
             .map(|i| (i as f32 * 0.07).sin() * 0.3)
+            .collect()
+    }
+
+    fn noise(seconds_long: f32, amplitude: f32) -> Vec<f32> {
+        (0..seconds(seconds_long))
+            .map(|i| if i % 2 == 0 { amplitude } else { -amplitude })
             .collect()
     }
 
@@ -211,50 +209,33 @@ mod tests {
     }
 
     #[test]
-    fn a_pause_past_the_search_range_is_left_out() {
-        // The whole 17.5-22.5 s search range sits in a pause that lasts
-        // until 24 s. The first window ends by 22.5 s; the second opens
-        // just before speech resumes, not on 1.5 s of silence.
-        let mut samples = tone(18.0);
-        samples.extend(vec![0.0; seconds(6.0)]);
+    fn a_noisy_pause_past_the_search_range_stays_in_the_windows() {
+        // An 8 s pause of room noise only 20 dB under the speech covers the
+        // whole 17.5-22.5 s search range. No audio is left out: the next
+        // window opens on the rest of the pause, and `speech_start` finds
+        // where its speech begins.
+        let mut samples = tone(16.0);
+        samples.extend(noise(8.0, 0.02));
         samples.extend(tone(16.0));
         let ranges = windows(&samples);
-        assert_eq!(ranges.len(), 2);
-        assert!(ranges[0].end <= seconds(22.5), "{:?}", ranges);
+        assert_covers(&ranges, samples.len());
+        let second = &samples[ranges[1].clone()];
+        let start = speech_start(second).expect("the window opens on the pause");
+        let resumes = seconds(24.0) - ranges[1].start;
         assert!(
-            ranges[1].start >= seconds(24.0 - LEAD_SECONDS - 0.05)
-                && ranges[1].start <= seconds(24.0),
-            "{:?}",
-            ranges
+            start <= resumes && start + seconds(LEAD_SECONDS + 0.05) >= resumes,
+            "speech at {resumes}, start {start}"
         );
-        assert!(samples[ranges[0].end..ranges[1].start]
-            .iter()
-            .all(|s| *s == 0.0));
-        assert_eq!(ranges[1].end, samples.len());
-    }
-
-    #[test]
-    fn a_take_ending_in_silence_gets_no_silent_window() {
-        let mut samples = tone(30.0);
-        samples.extend(vec![0.0; seconds(12.0)]);
-        let ranges = windows(&samples);
-        assert_eq!(ranges.first().map(|r| r.start), Some(0));
-        assert!(ranges.last().unwrap().end <= seconds(30.5), "{:?}", ranges);
-        assert!(ranges.last().unwrap().end >= seconds(30.0), "{:?}", ranges);
     }
 
     #[test]
     fn quiet_speech_past_a_loud_click_is_never_left_out() {
-        // No real silence anywhere; a quiet passage (-37 dBFS) covers the
-        // whole 17.5-22.5 s search range and runs on to 26 s, and one loud
-        // click makes it look far down. Every sample is still decoded.
-        let quiet = |seconds_long: f32| -> Vec<f32> {
-            (0..seconds(seconds_long))
-                .map(|i| (i as f32 * 0.07).sin() * 0.02)
-                .collect()
-        };
         let mut samples = tone(17.0);
-        samples.extend(quiet(9.0));
+        samples.extend(
+            (0..seconds(9.0))
+                .map(|i| (i as f32 * 0.07).sin() * 0.02)
+                .collect::<Vec<_>>(),
+        );
         samples.extend(tone(14.0));
         for sample in &mut samples[seconds(5.0)..seconds(5.0) + FRAME] {
             *sample = 1.0;
@@ -263,15 +244,33 @@ mod tests {
     }
 
     #[test]
-    fn soft_speech_is_never_left_out() {
-        // Loud and soft stretches, the soft ones 15 dB down: quieter than
-        // their neighbours but not a pause, so every sample is decoded.
-        let samples: Vec<f32> = (0..seconds(61.0))
-            .map(|i| {
-                let loud = (i / seconds(0.5)) % 2 == 0;
-                (i as f32 * 0.07).sin() * if loud { 0.3 } else { 0.05 }
-            })
+    fn speech_start_finds_a_real_lead_in() {
+        for (level, lead) in [(0.0, 1.5), (0.004, 1.5), (0.02, 2.0), (0.004, 0.6)] {
+            let mut samples = noise(lead, level);
+            samples.extend(tone(3.0));
+            let start = speech_start(&samples).expect("opens on a pause");
+            let speech = seconds(lead);
+            assert!(
+                start <= speech && start + seconds(LEAD_SECONDS + 0.05) >= speech,
+                "level {level}, lead {lead}: start {start}"
+            );
+        }
+    }
+
+    #[test]
+    fn speech_start_leaves_speech_openings_alone() {
+        // Speech right away, a short breath first, quiet speech that gets
+        // louder, or no speech at all: nothing to skip.
+        assert_eq!(speech_start(&tone(3.0)), None);
+        let mut short = noise(0.3, 0.004);
+        short.extend(tone(3.0));
+        assert_eq!(speech_start(&short), None);
+        let mut rising: Vec<f32> = (0..seconds(2.0))
+            .map(|i| (i as f32 * 0.07).sin() * 0.15)
             .collect();
-        assert_covers(&windows(&samples), samples.len());
+        rising.extend(tone(3.0));
+        assert_eq!(speech_start(&rising), None);
+        assert_eq!(speech_start(&noise(3.0, 0.004)), None);
+        assert_eq!(speech_start(&[]), None);
     }
 }

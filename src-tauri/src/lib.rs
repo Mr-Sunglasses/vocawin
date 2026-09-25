@@ -2182,6 +2182,11 @@ fn transcribe_onnx(
 /// Decodes a take in `chunking` windows and joins the text. Canary and
 /// Moonshine drop or repeat text on long takes, Moonshine rejects takes over
 /// 64 s, and GigaAM's encoder rejects takes over 200 s.
+///
+/// Moonshine also returns nothing for a window that opens on a second or
+/// more of pause (a pause too long for a cut to reach past, or any take with
+/// Skip Silence off). A window that decodes to nothing is decoded once more
+/// from where its speech starts; it had no text to lose.
 fn decode_in_windows(
     pcm: &[f32],
     mut decode: impl FnMut(&[f32]) -> Result<String, String>,
@@ -2192,7 +2197,14 @@ fn decode_in_windows(
     }
     let mut parts = Vec::with_capacity(ranges.len());
     for range in ranges {
-        let text = decode(&pcm[range])?;
+        let window = &pcm[range];
+        let mut text = decode(window)?;
+        if text.trim().is_empty() {
+            if let Some(start) = chunking::speech_start(window) {
+                logbuf::debug("A window decoded to nothing; decoding it again from its speech.");
+                text = decode(&window[start..])?;
+            }
+        }
         let text = text.trim();
         if !text.is_empty() {
             parts.push(text.to_owned());
@@ -3926,6 +3938,37 @@ mod tests {
         .unwrap();
         assert_eq!(index, 3);
         assert_eq!(text, "first part third part");
+    }
+
+    #[test]
+    fn an_empty_window_is_decoded_again_from_its_speech() {
+        // Like Moonshine: nothing for audio that opens on half a second or
+        // more of pause.
+        let mut pcm = vec![0.0; 16_000 * 2];
+        pcm.extend((0..16_000 * 3).map(|i| (i as f32 * 0.07).sin() * 0.3));
+        let mut lengths = Vec::new();
+        let text = decode_in_windows(&pcm, |window| {
+            lengths.push(window.len());
+            Ok(if window[..8_000].iter().all(|s| *s == 0.0) {
+                String::new()
+            } else {
+                "speech".into()
+            })
+        })
+        .unwrap();
+        assert_eq!(text, "speech");
+        assert_eq!(lengths.len(), 2);
+        assert_eq!(lengths[0], pcm.len());
+        assert!(lengths[1] >= 16_000 * 3 && lengths[1] <= 16_000 * 3 + 3_200 + 480);
+
+        // Text on the first pass: no second one.
+        let mut calls = 0;
+        decode_in_windows(&pcm, |_| {
+            calls += 1;
+            Ok("speech".into())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
     }
 
     #[test]
