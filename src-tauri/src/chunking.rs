@@ -41,6 +41,9 @@ const SOUND_OVER_OPENING: f32 = 3.0;
 const MINIMUM_SOUND_RMS: f32 = 0.004;
 /// Most retry points `speech_starts` offers for one window.
 const MAXIMUM_STARTS: usize = 3;
+/// A sound this long is speech (`silence.rs`'s shortest); shorter ones may
+/// be clicks, so the first sustained sound always gets a retry point.
+const MINIMUM_SPEECH_SECONDS: f32 = 0.12;
 
 fn seconds(value: f32) -> usize {
     (value * SAMPLE_RATE as f32) as usize
@@ -103,7 +106,9 @@ fn cut_point(samples: &[f32], lower: usize, upper: usize) -> usize {
 
 /// Where to retry a window that opens on a pause, earliest first: just
 /// before each sound (`LEAD_SECONDS` early) that follows at least
-/// `OPENING_SECONDS` of pause, at most `MAXIMUM_STARTS` of them.
+/// `OPENING_SECONDS` of pause, up to the first sustained one, at most
+/// `MAXIMUM_STARTS` of them. When brief sounds would crowd it out, the
+/// first sustained sound (`MINIMUM_SPEECH_SECONDS`) keeps the last place.
 ///
 /// The pause is measured from the window's own opening, so a noisy room
 /// counts as a pause while speech is clearly louder. A sound of any length
@@ -122,6 +127,7 @@ pub fn speech_starts(samples: &[f32]) -> Vec<usize> {
     let mut opening = rms[..opening_frames].to_vec();
     opening.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let threshold = (opening[opening.len() / 2] * SOUND_OVER_OPENING).max(MINIMUM_SOUND_RMS);
+    let speech_frames = (seconds(MINIMUM_SPEECH_SECONDS) / FRAME).max(1);
     let mut starts = Vec::new();
     let mut quiet_since = 0;
     for (index, value) in rms.iter().enumerate() {
@@ -130,11 +136,25 @@ pub fn speech_starts(samples: &[f32]) -> Vec<usize> {
         }
         if index - quiet_since >= opening_frames {
             starts.push((index * FRAME).saturating_sub(seconds(LEAD_SECONDS)));
-            if starts.len() == MAXIMUM_STARTS {
+            let sustained = rms[index..]
+                .iter()
+                .take(speech_frames)
+                .filter(|value| **value >= threshold)
+                .count()
+                == speech_frames;
+            if sustained {
+                // A retry from here decodes everything after it, so later
+                // sounds need no start of their own.
                 break;
             }
         }
         quiet_since = index + 1;
+    }
+    if starts.len() > MAXIMUM_STARTS {
+        // Brief sounds first, but the first sustained one is always tried.
+        let last = starts[starts.len() - 1];
+        starts.truncate(MAXIMUM_STARTS - 1);
+        starts.push(last);
     }
     starts
 }
@@ -326,6 +346,22 @@ mod tests {
         assert!(speech_starts(&rising).is_empty());
         assert!(speech_starts(&noise(3.0, 0.004)).is_empty());
         assert!(speech_starts(&[]).is_empty());
+    }
+
+    #[test]
+    fn many_clicks_do_not_crowd_out_the_speech() {
+        // Clicks at 0.9, 1.6, 2.3 and 3.0 s, then speech at 3.8 s: the first
+        // two clicks, then the speech; the last two clicks get no retry.
+        let mut samples = noise(3.8, 0.004);
+        for at in [0.9, 1.6, 2.3, 3.0] {
+            click(&mut samples, at);
+        }
+        samples.extend(tone(3.0));
+        let starts = speech_starts(&samples);
+        assert_eq!(starts.len(), MAXIMUM_STARTS, "{starts:?}");
+        assert_starts_before(starts[0], 0.9);
+        assert_starts_before(starts[1], 1.6);
+        assert_starts_before(starts[2], 3.8);
     }
 
     #[test]
