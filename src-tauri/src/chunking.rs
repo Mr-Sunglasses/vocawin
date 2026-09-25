@@ -10,7 +10,7 @@
 //!
 //! Windows cover every sample. Deciding up front which audio is silence
 //! would sometimes drop quiet speech, so nothing is left out here; a window
-//! that decodes to nothing is decoded again from `speech_start` instead.
+//! that decodes to nothing is decoded again from `speech_starts` instead.
 
 use std::ops::Range;
 
@@ -32,16 +32,15 @@ const QUIET_FLOOR: f32 = 0.004 * 0.004 * FRAME as f32;
 /// that starts on a second or more of silence, so a cut goes near the end
 /// of its pause and the rest of the pause trails the previous window.
 const LEAD_SECONDS: f32 = 0.2;
-/// `speech_start` measures a window's opening level over this long, and
-/// only reports a lead-in at least this long.
+/// `speech_starts` measures a window's opening level over this long, and a
+/// sound only starts a retry after at least this long of pause.
 const OPENING_SECONDS: f32 = 0.5;
-/// Speech is this many times the opening's RMS (about 10 dB up).
-const SPEECH_OVER_OPENING: f32 = 3.0;
-/// Lowest RMS that counts as speech, `silence.rs`'s minimum.
-const MINIMUM_SPEECH_RMS: f32 = 0.004;
-/// Speech lasts at least this long; a shorter burst (a click, a knock) is
-/// part of the pause, as in `silence.rs`.
-const MINIMUM_SPEECH_SECONDS: f32 = 0.12;
+/// Sound is this many times the opening's RMS (about 10 dB up).
+const SOUND_OVER_OPENING: f32 = 3.0;
+/// Lowest RMS that counts as sound, `silence.rs`'s minimum.
+const MINIMUM_SOUND_RMS: f32 = 0.004;
+/// Most retry points `speech_starts` offers for one window.
+const MAXIMUM_STARTS: usize = 3;
 
 fn seconds(value: f32) -> usize {
     (value * SAMPLE_RATE as f32) as usize
@@ -102,29 +101,42 @@ fn cut_point(samples: &[f32], lower: usize, upper: usize) -> usize {
         .max(middle)
 }
 
-/// Where speech starts in a window that opens on a pause, `LEAD_SECONDS`
-/// early. The pause is measured from the window's own opening, so a noisy
-/// room counts as a pause as long as speech is clearly louder, and a click
-/// inside it is not taken for speech. `None` when
-/// the window opens on speech, has a lead-in shorter than `OPENING_SECONDS`,
-/// or has no speech.
-pub fn speech_start(samples: &[f32]) -> Option<usize> {
+/// Where to retry a window that opens on a pause, earliest first: just
+/// before each sound (`LEAD_SECONDS` early) that follows at least
+/// `OPENING_SECONDS` of pause, at most `MAXIMUM_STARTS` of them.
+///
+/// The pause is measured from the window's own opening, so a noisy room
+/// counts as a pause while speech is clearly louder. A sound of any length
+/// counts, so a short word is never skipped; if the sound was a click and
+/// the retry from it still decodes to nothing, the next start is past it.
+/// Empty when the window opens on sound or has none.
+pub fn speech_starts(samples: &[f32]) -> Vec<usize> {
     let rms: Vec<f32> = samples
         .chunks(FRAME)
         .map(|frame| (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt())
         .collect();
     let opening_frames = seconds(OPENING_SECONDS) / FRAME;
     if rms.len() <= opening_frames {
-        return None;
+        return Vec::new();
     }
     let mut opening = rms[..opening_frames].to_vec();
     opening.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let threshold = (opening[opening.len() / 2] * SPEECH_OVER_OPENING).max(MINIMUM_SPEECH_RMS);
-    let speech_frames = (seconds(MINIMUM_SPEECH_SECONDS) / FRAME).max(1);
-    let first = rms
-        .windows(speech_frames)
-        .position(|run| run.iter().all(|value| *value >= threshold))?;
-    (first >= opening_frames).then(|| (first * FRAME).saturating_sub(seconds(LEAD_SECONDS)))
+    let threshold = (opening[opening.len() / 2] * SOUND_OVER_OPENING).max(MINIMUM_SOUND_RMS);
+    let mut starts = Vec::new();
+    let mut quiet_since = 0;
+    for (index, value) in rms.iter().enumerate() {
+        if *value < threshold {
+            continue;
+        }
+        if index - quiet_since >= opening_frames {
+            starts.push((index * FRAME).saturating_sub(seconds(LEAD_SECONDS)));
+            if starts.len() == MAXIMUM_STARTS {
+                break;
+            }
+        }
+        quiet_since = index + 1;
+    }
+    starts
 }
 
 #[cfg(test)]
@@ -143,12 +155,26 @@ mod tests {
             .collect()
     }
 
+    fn click(samples: &mut [f32], at_seconds: f32) {
+        for sample in &mut samples[seconds(at_seconds)..seconds(at_seconds) + FRAME] {
+            *sample = 1.0;
+        }
+    }
+
     fn assert_covers(ranges: &[Range<usize>], total: usize) {
         assert_eq!(ranges.first().map(|r| r.start), Some(0));
         assert_eq!(ranges.last().map(|r| r.end), Some(total));
         for pair in ranges.windows(2) {
             assert_eq!(pair[0].end, pair[1].start);
         }
+    }
+
+    fn assert_starts_before(start: usize, sound_seconds: f32) {
+        let sound = seconds(sound_seconds);
+        assert!(
+            start <= sound && start + seconds(LEAD_SECONDS + 0.05) >= sound,
+            "start {start} for sound at {sound_seconds}s"
+        );
     }
 
     #[test]
@@ -219,20 +245,17 @@ mod tests {
     fn a_noisy_pause_past_the_search_range_stays_in_the_windows() {
         // An 8 s pause of room noise only 20 dB under the speech covers the
         // whole 17.5-22.5 s search range. No audio is left out: the next
-        // window opens on the rest of the pause, and `speech_start` finds
+        // window opens on the rest of the pause, and `speech_starts` finds
         // where its speech begins.
         let mut samples = tone(16.0);
         samples.extend(noise(8.0, 0.02));
         samples.extend(tone(16.0));
         let ranges = windows(&samples);
         assert_covers(&ranges, samples.len());
-        let second = &samples[ranges[1].clone()];
-        let start = speech_start(second).expect("the window opens on the pause");
-        let resumes = seconds(24.0) - ranges[1].start;
-        assert!(
-            start <= resumes && start + seconds(LEAD_SECONDS + 0.05) >= resumes,
-            "speech at {resumes}, start {start}"
-        );
+        let starts = speech_starts(&samples[ranges[1].clone()]);
+        let resumes = 24.0 - ranges[1].start as f32 / SAMPLE_RATE as f32;
+        assert_eq!(starts.len(), 1, "{starts:?}");
+        assert_starts_before(starts[0], resumes);
     }
 
     #[test]
@@ -244,61 +267,74 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         samples.extend(tone(14.0));
-        for sample in &mut samples[seconds(5.0)..seconds(5.0) + FRAME] {
-            *sample = 1.0;
-        }
+        click(&mut samples, 5.0);
         assert_covers(&windows(&samples), samples.len());
     }
 
     #[test]
-    fn speech_start_finds_a_real_lead_in() {
+    fn speech_starts_find_a_real_lead_in() {
         for (level, lead) in [(0.0, 1.5), (0.004, 1.5), (0.02, 2.0), (0.004, 0.6)] {
             let mut samples = noise(lead, level);
             samples.extend(tone(3.0));
-            let start = speech_start(&samples).expect("opens on a pause");
-            let speech = seconds(lead);
-            assert!(
-                start <= speech && start + seconds(LEAD_SECONDS + 0.05) >= speech,
-                "level {level}, lead {lead}: start {start}"
-            );
+            let starts = speech_starts(&samples);
+            assert_eq!(starts.len(), 1, "level {level}, lead {lead}: {starts:?}");
+            assert_starts_before(starts[0], lead);
         }
     }
 
     #[test]
-    fn a_click_in_the_pause_is_not_speech() {
-        // Clicks at 0.2 s (inside the measured opening) and at 0.9 s, in a
-        // 1.5 s pause: speech still starts at 1.5 s.
+    fn a_short_word_in_the_pause_is_tried_first() {
+        // A 60 ms word at 1.0 s, then 1.5 s more pause before speech.
+        let mut samples = noise(1.0, 0.004);
+        samples.extend(tone(0.06));
+        samples.extend(noise(1.5, 0.004));
+        samples.extend(tone(3.0));
+        let starts = speech_starts(&samples);
+        assert_eq!(starts.len(), 2, "{starts:?}");
+        assert_starts_before(starts[0], 1.0);
+        assert_starts_before(starts[1], 2.56);
+    }
+
+    #[test]
+    fn a_click_in_the_pause_does_not_block_the_speech() {
+        // A click 0.2 s in is too close to the start to retry from; one at
+        // 0.9 s is tried first, then the speech at 1.5 s after it.
         for level in [0.0, 0.004, 0.02] {
             let mut samples = noise(1.5, level);
-            for at in [0.2, 0.9] {
-                for sample in &mut samples[seconds(at)..seconds(at) + FRAME] {
-                    *sample = 1.0;
-                }
-            }
+            click(&mut samples, 0.2);
+            click(&mut samples, 0.9);
             samples.extend(tone(3.0));
-            let start = speech_start(&samples).expect("opens on a pause");
-            let speech = seconds(1.5);
-            assert!(
-                start <= speech && start + seconds(LEAD_SECONDS + 0.05) >= speech,
-                "level {level}: start {start}"
-            );
+            let starts = speech_starts(&samples);
+            assert_eq!(starts.len(), 2, "level {level}: {starts:?}");
+            assert_starts_before(starts[0], 0.9);
+            assert_starts_before(starts[1], 1.5);
         }
     }
 
     #[test]
-    fn speech_start_leaves_speech_openings_alone() {
+    fn speech_starts_leave_speech_openings_alone() {
         // Speech right away, a short breath first, quiet speech that gets
-        // louder, or no speech at all: nothing to skip.
-        assert_eq!(speech_start(&tone(3.0)), None);
+        // louder, or no sound at all: nothing to retry from.
+        assert!(speech_starts(&tone(3.0)).is_empty());
         let mut short = noise(0.3, 0.004);
         short.extend(tone(3.0));
-        assert_eq!(speech_start(&short), None);
+        assert!(speech_starts(&short).is_empty());
         let mut rising: Vec<f32> = (0..seconds(2.0))
             .map(|i| (i as f32 * 0.07).sin() * 0.15)
             .collect();
         rising.extend(tone(3.0));
-        assert_eq!(speech_start(&rising), None);
-        assert_eq!(speech_start(&noise(3.0, 0.004)), None);
-        assert_eq!(speech_start(&[]), None);
+        assert!(speech_starts(&rising).is_empty());
+        assert!(speech_starts(&noise(3.0, 0.004)).is_empty());
+        assert!(speech_starts(&[]).is_empty());
+    }
+
+    #[test]
+    fn no_more_than_three_starts() {
+        let mut samples = Vec::new();
+        for _ in 0..6 {
+            samples.extend(noise(0.8, 0.004));
+            samples.extend(tone(0.06));
+        }
+        assert_eq!(speech_starts(&samples).len(), MAXIMUM_STARTS);
     }
 }

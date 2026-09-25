@@ -2185,8 +2185,9 @@ fn transcribe_onnx(
 ///
 /// Moonshine also returns nothing for a window that opens on a second or
 /// more of pause (a pause too long for a cut to reach past, or any take with
-/// Skip Silence off). A window that decodes to nothing is decoded once more
-/// from where its speech starts; it had no text to lose.
+/// Skip Silence off). A window that decodes to nothing is decoded again from
+/// each place its speech may start, earliest first, until one gives text;
+/// it had no text to lose.
 fn decode_in_windows(
     pcm: &[f32],
     mut decode: impl FnMut(&[f32]) -> Result<String, String>,
@@ -2200,9 +2201,12 @@ fn decode_in_windows(
         let window = &pcm[range];
         let mut text = decode(window)?;
         if text.trim().is_empty() {
-            if let Some(start) = chunking::speech_start(window) {
+            for start in chunking::speech_starts(window) {
                 logbuf::debug("A window decoded to nothing; decoding it again from its speech.");
                 text = decode(&window[start..])?;
+                if !text.trim().is_empty() {
+                    break;
+                }
             }
         }
         let text = text.trim();
@@ -3941,15 +3945,20 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_window_is_decoded_again_from_its_speech() {
-        // Like Moonshine: nothing for audio that opens on half a second or
-        // more of pause.
-        let mut pcm = vec![0.0; 16_000 * 2];
+    fn an_empty_window_is_retried_from_each_speech_start_in_turn() {
+        // 0.5 s of pause, a click, 1 s more pause, then speech. Like
+        // Moonshine, the stub returns nothing for audio that opens on half a
+        // second or more of quiet, and a click counts as quiet.
+        let quiet_opening =
+            |window: &[f32]| window[..8_000].iter().filter(|s| s.abs() >= 0.1).count() < 1_000;
+        let mut pcm = vec![0.0; 8_000 + 4_800];
+        pcm.extend(vec![1.0; 480]);
+        pcm.extend(vec![0.0; 16_000]);
         pcm.extend((0..16_000 * 3).map(|i| (i as f32 * 0.07).sin() * 0.3));
         let mut lengths = Vec::new();
         let text = decode_in_windows(&pcm, |window| {
             lengths.push(window.len());
-            Ok(if window[..8_000].iter().all(|s| *s == 0.0) {
+            Ok(if quiet_opening(window) {
                 String::new()
             } else {
                 "speech".into()
@@ -3957,9 +3966,12 @@ mod tests {
         })
         .unwrap();
         assert_eq!(text, "speech");
-        assert_eq!(lengths.len(), 2);
+        // The whole take, from just before the click, from just before the
+        // speech.
+        assert_eq!(lengths.len(), 3, "{lengths:?}");
         assert_eq!(lengths[0], pcm.len());
-        assert!(lengths[1] >= 16_000 * 3 && lengths[1] <= 16_000 * 3 + 3_200 + 480);
+        assert!(lengths[1] < lengths[0] && lengths[2] < lengths[1]);
+        assert!(lengths[2] <= 16_000 * 3 + 3_200 + 480, "{lengths:?}");
 
         // Text on the first pass: no second one.
         let mut calls = 0;
