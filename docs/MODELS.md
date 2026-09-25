@@ -34,6 +34,10 @@ Whisper-family models are a single GGML `.bin`. ONNX models are directories whos
 
 VocaWin's Windows dependency enables ONNX Runtime's DirectML execution provider. If it is not available for a model or GPU, ONNX Runtime falls back to CPU.
 
+## Long takes
+
+Canary, Moonshine and GigaAM get takes longer than 20 seconds in windows of up to about 25 seconds, cut in pauses, and the window texts are joined (`src-tauri/src/chunking.rs`). Decoded whole, Canary skips sentences once real speech runs past roughly 40 seconds, Moonshine repeats a phrase and rejects anything over 64 seconds, and GigaAM's encoder rejects anything over 200 seconds. Whisper already decodes in 30-second windows. Parakeet and SenseVoice decode the whole take.
+
 ## Not in the catalog
 
 `parakeet-ctc-1.1b` and `vosk-small-en` stay out of the Models list until an adapter can transcribe them. The UI never offers a Download that cannot run.

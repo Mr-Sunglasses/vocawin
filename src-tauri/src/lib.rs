@@ -3,6 +3,7 @@
 
 mod autopause;
 mod autostart;
+mod chunking;
 mod cleanup;
 mod devices;
 mod dictionary;
@@ -2115,13 +2116,14 @@ fn transcribe_onnx(
             model_path.display()
         ));
     }
-    let result = match model_id {
+    let text = match model_id {
         "parakeet-tdt-0.6b-v3" => {
             let mut model = ParakeetModel::load(&model_path, &Quantization::Int8)
                 .map_err(|error| format!("Could not load Parakeet: {error}"))?;
             model
                 .transcribe_with(pcm, &ParakeetParams::default())
                 .map_err(|error| format!("Parakeet transcription failed: {error}"))?
+                .text
         }
         "moonshine-tiny" | "moonshine-base" => {
             let variant = if model_id == "moonshine-tiny" {
@@ -2131,15 +2133,12 @@ fn transcribe_onnx(
             };
             let mut model = MoonshineModel::load(&model_path, variant, &Quantization::default())
                 .map_err(|error| format!("Could not load Moonshine: {error}"))?;
-            // Moonshine's public adapter takes a WAV path. The PCM is already
-            // mono/16 kHz, so writing this short temporary file is lossless.
-            let wav_path = models_path.join(".vocawin-recording.wav");
-            write_pcm_wav(&wav_path, pcm)?;
-            let output = model
-                .transcribe_file(&wav_path, &transcribe_rs::TranscribeOptions::default())
-                .map_err(|error| format!("Moonshine transcription failed: {error}"));
-            let _ = fs::remove_file(wav_path);
-            output?
+            decode_in_windows(pcm, |window| {
+                model
+                    .transcribe(window, &transcribe_rs::TranscribeOptions::default())
+                    .map(|result| result.text)
+                    .map_err(|error| format!("Moonshine transcription failed: {error}"))
+            })?
         }
         "sensevoice-small" => {
             let mut model = SenseVoiceModel::load(&model_path, &Quantization::Int8)
@@ -2153,47 +2152,53 @@ fn transcribe_onnx(
                     },
                 )
                 .map_err(|error| format!("SenseVoice transcription failed: {error}"))?
+                .text
         }
         "gigaam-v3" => {
             let mut model = GigaAMModel::load(&model_path, &Quantization::Int8)
                 .map_err(|error| format!("Could not load GigaAM: {error}"))?;
-            let wav_path = models_path.join(".vocawin-recording.wav");
-            write_pcm_wav(&wav_path, pcm)?;
-            let output = model
-                .transcribe_file(&wav_path, &transcribe_rs::TranscribeOptions::default())
-                .map_err(|error| format!("GigaAM transcription failed: {error}"));
-            let _ = fs::remove_file(wav_path);
-            output?
+            decode_in_windows(pcm, |window| {
+                model
+                    .transcribe(window, &transcribe_rs::TranscribeOptions::default())
+                    .map(|result| result.text)
+                    .map_err(|error| format!("GigaAM transcription failed: {error}"))
+            })?
         }
         "canary-180m" => {
             let mut model = CanaryModel::load(&model_path, &Quantization::Int8)
                 .map_err(|error| format!("Could not load Canary: {error}"))?;
-            model
-                .transcribe_with(pcm, &CanaryParams::default())
-                .map_err(|error| format!("Canary transcription failed: {error}"))?
+            decode_in_windows(pcm, |window| {
+                model
+                    .transcribe_with(window, &CanaryParams::default())
+                    .map(|result| result.text)
+                    .map_err(|error| format!("Canary transcription failed: {error}"))
+            })?
         }
         _ => return Err(format!("The {} adapter is not available yet.", model_id)),
     };
-    Ok(result.text.trim().to_string())
+    Ok(text.trim().to_string())
 }
 
-fn write_pcm_wav(path: &std::path::Path, pcm: &[f32]) -> Result<(), String> {
-    let specification = hound::WavSpec {
-        channels: 1,
-        sample_rate: 16_000,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(path, specification)
-        .map_err(|error| format!("Could not prepare audio for transcription: {error}"))?;
-    for sample in pcm {
-        writer
-            .write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-            .map_err(|error| format!("Could not write audio for transcription: {error}"))?;
+/// Decodes a take in `chunking` windows and joins the text. Canary and
+/// Moonshine drop or repeat text on long takes, Moonshine rejects takes over
+/// 64 s, and GigaAM's encoder rejects takes over 200 s.
+fn decode_in_windows(
+    pcm: &[f32],
+    mut decode: impl FnMut(&[f32]) -> Result<String, String>,
+) -> Result<String, String> {
+    let ranges = chunking::windows(pcm);
+    if ranges.len() > 1 {
+        logbuf::debug(format!("Decoding the take in {} windows.", ranges.len()));
     }
-    writer
-        .finalize()
-        .map_err(|error| format!("Could not finalize audio for transcription: {error}"))
+    let mut parts = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let text = decode(&pcm[range])?;
+        let text = text.trim();
+        if !text.is_empty() {
+            parts.push(text.to_owned());
+        }
+    }
+    Ok(parts.join(" "))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
