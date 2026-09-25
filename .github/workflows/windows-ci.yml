@@ -113,31 +113,6 @@ jobs:
       # Tauri command layer. Does not require a physical GPU or microphone.
       - name: Test Rust command layer
         run: cargo test --manifest-path src-tauri/Cargo.toml
-      # TEMPORARY (PR #62): name the import the test binary cannot resolve.
-      - name: Diagnose missing imports
-        if: failure()
-        shell: pwsh
-        run: |
-          $exe = Get-ChildItem C:\t\debug\deps\vocawin_lib-*.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          Write-Output "Binary: $($exe.FullName)"
-          Add-Type -Namespace Diag -Name Native -MemberDefinition @'
-          [DllImport("kernel32", SetLastError=true, CharSet=CharSet.Unicode)] public static extern IntPtr LoadLibraryExW(string name, IntPtr file, uint flags);
-          [DllImport("kernel32", SetLastError=true, CharSet=CharSet.Ansi)] public static extern IntPtr GetProcAddress(IntPtr module, string name);
-          '@
-          $dll = $null
-          $missing = 0
-          foreach ($line in (dumpbin /nologo /imports $exe.FullName)) {
-            if ($line -match '^\s{4}(\S+\.dll)\s*$') { $dll = $Matches[1]; continue }
-            if ($dll -and $line -match '^\s+[0-9A-Fa-f]+\s+(\S+)\s*$') {
-              $name = $Matches[1]
-              $module = [Diag.Native]::LoadLibraryExW($dll, [IntPtr]::Zero, 0)
-              if ($module -eq [IntPtr]::Zero) { Write-Output "MISSING DLL $dll"; $missing++; continue }
-              if ([Diag.Native]::GetProcAddress($module, $name) -eq [IntPtr]::Zero) { Write-Output "MISSING $dll!$name"; $missing++ }
-            }
-          }
-          Write-Output "Missing imports: $missing"
-          Write-Output "DLLs next to the binary:"
-          Get-ChildItem C:\t\debug\deps\*.dll | ForEach-Object { $_.Name }
 
   installer:
     name: Windows installer (beta)
