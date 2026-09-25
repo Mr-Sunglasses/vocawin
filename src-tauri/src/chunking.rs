@@ -39,6 +39,9 @@ const OPENING_SECONDS: f32 = 0.5;
 const SPEECH_OVER_OPENING: f32 = 3.0;
 /// Lowest RMS that counts as speech, `silence.rs`'s minimum.
 const MINIMUM_SPEECH_RMS: f32 = 0.004;
+/// Speech lasts at least this long; a shorter burst (a click, a knock) is
+/// part of the pause, as in `silence.rs`.
+const MINIMUM_SPEECH_SECONDS: f32 = 0.12;
 
 fn seconds(value: f32) -> usize {
     (value * SAMPLE_RATE as f32) as usize
@@ -101,7 +104,8 @@ fn cut_point(samples: &[f32], lower: usize, upper: usize) -> usize {
 
 /// Where speech starts in a window that opens on a pause, `LEAD_SECONDS`
 /// early. The pause is measured from the window's own opening, so a noisy
-/// room counts as a pause as long as speech is clearly louder. `None` when
+/// room counts as a pause as long as speech is clearly louder, and a click
+/// inside it is not taken for speech. `None` when
 /// the window opens on speech, has a lead-in shorter than `OPENING_SECONDS`,
 /// or has no speech.
 pub fn speech_start(samples: &[f32]) -> Option<usize> {
@@ -116,7 +120,10 @@ pub fn speech_start(samples: &[f32]) -> Option<usize> {
     let mut opening = rms[..opening_frames].to_vec();
     opening.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let threshold = (opening[opening.len() / 2] * SPEECH_OVER_OPENING).max(MINIMUM_SPEECH_RMS);
-    let first = rms.iter().position(|value| *value >= threshold)?;
+    let speech_frames = (seconds(MINIMUM_SPEECH_SECONDS) / FRAME).max(1);
+    let first = rms
+        .windows(speech_frames)
+        .position(|run| run.iter().all(|value| *value >= threshold))?;
     (first >= opening_frames).then(|| (first * FRAME).saturating_sub(seconds(LEAD_SECONDS)))
 }
 
@@ -253,6 +260,27 @@ mod tests {
             assert!(
                 start <= speech && start + seconds(LEAD_SECONDS + 0.05) >= speech,
                 "level {level}, lead {lead}: start {start}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_click_in_the_pause_is_not_speech() {
+        // Clicks at 0.2 s (inside the measured opening) and at 0.9 s, in a
+        // 1.5 s pause: speech still starts at 1.5 s.
+        for level in [0.0, 0.004, 0.02] {
+            let mut samples = noise(1.5, level);
+            for at in [0.2, 0.9] {
+                for sample in &mut samples[seconds(at)..seconds(at) + FRAME] {
+                    *sample = 1.0;
+                }
+            }
+            samples.extend(tone(3.0));
+            let start = speech_start(&samples).expect("opens on a pause");
+            let speech = seconds(1.5);
+            assert!(
+                start <= speech && start + seconds(LEAD_SECONDS + 0.05) >= speech,
+                "level {level}: start {start}"
             );
         }
     }
