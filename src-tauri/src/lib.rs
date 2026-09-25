@@ -66,8 +66,8 @@ fn whisper_acceleration() -> &'static str {
     }
 }
 
-fn onnx_acceleration(directml: bool) -> &'static str {
-    if directml && cfg!(windows) {
+fn onnx_acceleration(model_id: &str) -> &'static str {
+    if onnx_uses_directml(model_id) && cfg!(windows) {
         "CPU · DirectML"
     } else {
         "CPU"
@@ -160,7 +160,7 @@ fn model_catalog() -> Vec<Model> {
             engine: "ONNX Runtime",
             size: "478 MB",
             languages: "25 languages",
-            acceleration: onnx_acceleration(true),
+            acceleration: onnx_acceleration("parakeet-tdt-0.6b-v3"),
             description: "High-speed multilingual dictation.",
         },
         Model {
@@ -169,7 +169,7 @@ fn model_catalog() -> Vec<Model> {
             engine: "ONNX Runtime",
             size: "145 MB",
             languages: "English",
-            acceleration: onnx_acceleration(false),
+            acceleration: onnx_acceleration("moonshine-tiny"),
             description: "Low-memory, quick English notes.",
         },
         Model {
@@ -178,7 +178,7 @@ fn model_catalog() -> Vec<Model> {
             engine: "ONNX Runtime",
             size: "190 MB",
             languages: "English",
-            acceleration: onnx_acceleration(false),
+            acceleration: onnx_acceleration("moonshine-base"),
             description: "Compact English model.",
         },
         Model {
@@ -187,7 +187,7 @@ fn model_catalog() -> Vec<Model> {
             engine: "ONNX Runtime",
             size: "240 MB",
             languages: "Chinese · Japanese · Korean · Cantonese · English",
-            acceleration: onnx_acceleration(true),
+            acceleration: onnx_acceleration("sensevoice-small"),
             description: "East Asian language specialist.",
         },
         Model {
@@ -196,7 +196,7 @@ fn model_catalog() -> Vec<Model> {
             engine: "ONNX Runtime",
             size: "225 MB",
             languages: "Russian",
-            acceleration: onnx_acceleration(false),
+            acceleration: onnx_acceleration("gigaam-v3"),
             description: "Russian recognition with punctuation.",
         },
         Model {
@@ -205,7 +205,7 @@ fn model_catalog() -> Vec<Model> {
             engine: "ONNX Runtime",
             size: "150 MB",
             languages: "English · Spanish · German · French",
-            acceleration: onnx_acceleration(true),
+            acceleration: onnx_acceleration("canary-180m"),
             description: "Fast four-language transcription.",
         },
     ]
@@ -2575,12 +2575,68 @@ fn recognize_and_format(state: &AppState, settings: &Settings, pcm: &[f32]) -> R
     Ok(text)
 }
 
+/// ONNX models that run on DirectML when Windows has a hardware GPU. The
+/// catalog's "CPU · DirectML" label comes from this list.
+fn onnx_uses_directml(model_id: &str) -> bool {
+    matches!(
+        model_id,
+        "parakeet-tdt-0.6b-v3" | "sensevoice-small" | "canary-180m"
+    )
+}
+
+/// Set after DirectML fails once, so later takes in this run go straight to
+/// CPU instead of failing on the GPU first every time.
+static DIRECTML_FAILED: AtomicBool = AtomicBool::new(false);
+/// The ONNX Runtime accelerator is process-wide in transcribe-rs and read
+/// when a model loads, so one ONNX decode runs at a time (a history retry
+/// can overlap a live take).
+static ONNX_DECODE: Mutex<()> = Mutex::new(());
+
+/// `transcribe_onnx` on DirectML when the model and the PC support it, and
+/// on CPU when they do not or DirectML fails.
+fn transcribe_onnx_accelerated(
+    model_id: &str,
+    models_path: &Path,
+    pcm: &[f32],
+    language: Option<&str>,
+) -> Result<String, String> {
+    use transcribe_rs::accel::{set_ort_accelerator, OrtAccelerator};
+
+    let _decode = ONNX_DECODE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let directml = cfg!(windows)
+        && onnx_uses_directml(model_id)
+        && model_is_installed(models_path, model_id)
+        && !DIRECTML_FAILED.load(Ordering::Relaxed)
+        && gpu::detect_gpu().available;
+    if directml {
+        set_ort_accelerator(OrtAccelerator::DirectMl);
+        match transcribe_onnx(model_id, models_path, pcm, language) {
+            Ok(text) => return Ok(text),
+            Err(error) => {
+                DIRECTML_FAILED.store(true, Ordering::Relaxed);
+                logbuf::warn(format!(
+                    "DirectML failed for {model_id}; using CPU from now on: {error}"
+                ));
+            }
+        }
+    }
+    set_ort_accelerator(OrtAccelerator::CpuOnly);
+    transcribe_onnx(model_id, models_path, pcm, language)
+}
+
 fn recognize(state: &AppState, settings: &Settings, pcm: Vec<f32>) -> Result<String, String> {
     let language = language_code(&settings.language);
     if !settings.selected_model.starts_with("whisper-")
         && !settings.selected_model.starts_with("distil-whisper-")
     {
-        return transcribe_onnx(&settings.selected_model, &state.models_path, &pcm, language);
+        return transcribe_onnx_accelerated(
+            &settings.selected_model,
+            &state.models_path,
+            &pcm,
+            language,
+        );
     }
     let model_path = state
         .models_path
@@ -4011,6 +4067,26 @@ mod tests {
         assert!(!catalog
             .iter()
             .any(|m| m.id.contains("vosk") || m.id.contains("ctc")));
+    }
+
+    #[test]
+    fn onnx_directml_label_matches_the_models_that_use_it() {
+        let onnx: Vec<_> = model_catalog()
+            .into_iter()
+            .filter(|model| model.engine == "ONNX Runtime")
+            .collect();
+        assert!(!onnx.is_empty());
+        for model in onnx {
+            let expected = if cfg!(windows) && onnx_uses_directml(model.id) {
+                "CPU · DirectML"
+            } else {
+                "CPU"
+            };
+            assert_eq!(model.acceleration, expected, "{}", model.id);
+        }
+        assert!(onnx_uses_directml("canary-180m"));
+        assert!(!onnx_uses_directml("moonshine-base"));
+        assert!(!onnx_uses_directml("whisper-tiny"));
     }
 
     #[test]
