@@ -32,7 +32,7 @@ Whisper-family models are a single GGML `.bin`. ONNX models are directories whos
 | `gigaam-v3` | ONNX Runtime / GigaAM | [int8 archive](https://blob.handy.computer/giga-am-v3-int8.tar.gz) |
 | `canary-180m` | ONNX Runtime / Canary | [Canary 180M archive](https://blob.handy.computer/canary-180m-flash.tar.gz) |
 
-On Windows, Parakeet, SenseVoice and Canary run on ONNX Runtime's DirectML execution provider when DXGI finds a hardware GPU (software/WARP adapters do not count). DirectML uses the system's default adapter, which can differ from the one Settings names for Whisper. Operators DirectML cannot run fall back to CPU inside ONNX Runtime. If a DirectML load or decode fails, VocaWin decodes that take on CPU and keeps later takes on CPU until it restarts. Moonshine and GigaAM always run on CPU.
+On Windows, Parakeet, SenseVoice and Canary run on ONNX Runtime's DirectML execution provider when DXGI finds a hardware GPU (software/WARP adapters do not count). DirectML uses the system's default adapter, which can differ from the one Settings names for Whisper. Operators DirectML cannot run fall back to CPU inside ONNX Runtime. If a DirectML load or decode fails, VocaWin decodes that take again on CPU. When CPU succeeds, DirectML is blamed and later takes stay on CPU until VocaWin restarts; when CPU fails too, the model or audio is at fault and DirectML stays on. Moonshine and GigaAM always run on CPU.
 
 ## Long takes
 
