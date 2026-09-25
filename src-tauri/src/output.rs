@@ -59,21 +59,88 @@ pub fn apply_output_polish(text: &str, auto_capitalize: bool, trailing_space: bo
     result
 }
 
+/// Wait until Ctrl, Alt, Shift and Win are all up, or `timeout` passes.
+/// Text typed while a shortcut's modifiers are still held would arrive as
+/// shortcuts instead (paste-last fires on key-down).
+pub fn wait_for_modifiers_released(timeout: std::time::Duration) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+        const MODIFIERS: [i32; 5] = [0x10, 0x11, 0x12, 0x5B, 0x5C];
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let held = MODIFIERS
+                .iter()
+                .any(|vk| (unsafe { GetAsyncKeyState(*vk) } as u16) & 0x8000 != 0);
+            if !held {
+                // Let the key-up reach the target app before typing.
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = timeout;
+}
+
 /// Controls whether dictation is also left on the system clipboard.
 ///
 /// Matches VocaLinux `copy_to_clipboard` (default off) and VocaMac
 /// `preserveClipboard` (default on): do not take over the clipboard unless
 /// the user asks for it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InjectOptions {
     pub copy_to_clipboard: bool,
+    /// Paste (with clipboard restore) instead of typing, in every app.
+    pub paste_everywhere: bool,
+    /// Process names (`slack.exe`) that get a paste instead of typing: apps
+    /// that drop typed characters.
+    pub paste_apps: Vec<String>,
 }
 
 impl InjectOptions {
-    pub fn restore_clipboard(self) -> bool {
+    pub fn restore_clipboard(&self) -> bool {
         !self.copy_to_clipboard
     }
+
+    /// Whether the app in front should get a paste rather than typing.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn pastes_into(&self, process_name: Option<&str>) -> bool {
+        self.paste_everywhere
+            || process_name.is_some_and(|name| {
+                let name = normalize_process_name(name);
+                self.paste_apps
+                    .iter()
+                    .any(|app| normalize_process_name(app) == name)
+            })
+    }
 }
+
+// The typing and paste constants below are used by the Windows injector only.
+#[cfg_attr(not(windows), allow(dead_code))]
+/// Characters typed per SendInput call. One huge burst makes some apps
+/// (Electron, terminals, remote sessions) drop or reorder characters.
+const TYPING_CHUNK_CHARS: usize = 24;
+/// Pause between chunks, so the target's input queue keeps up.
+#[cfg_attr(not(windows), allow(dead_code))]
+const TYPING_CHUNK_PAUSE_MS: u64 = 4;
+
+/// Longest wait for the user to let go of Ctrl/Alt/Shift/Win before typing.
+#[cfg_attr(not(windows), allow(dead_code))]
+const MODIFIER_RELEASE_WAIT_MS: u64 = 600;
+
+/// After Ctrl+V, how long the target gets to read the clipboard before the
+/// previous contents come back. Slow apps (Office, Electron under load) read
+/// it lazily; too short and they paste the old clipboard.
+#[cfg_attr(not(windows), allow(dead_code))]
+const PASTE_SETTLE_MS: u64 = 250;
+
+/// Shown when the app in front runs as administrator. Windows (UIPI) drops
+/// typed and pasted input into it without telling the sender.
+#[cfg_attr(not(windows), allow(dead_code))]
+const ELEVATED_TARGET: &str =
+    "Admin app blocks typing. Text is on the clipboard: press Ctrl+V.";
 
 /// Classic Notepad / WordPad accept UNICODE SendInput (caret moves) but
 /// drop or blank the glyphs. Clipboard Ctrl+V usually works.
@@ -100,7 +167,7 @@ fn prefers_clipboard_inject(process_name: &str) -> bool {
     CLIPBOARD_INJECT_PROCESS_NAMES.contains(&normalize_process_name(process_name).as_str())
 }
 
-pub fn inject(text: &str, options: InjectOptions) -> Result<(), String> {
+pub fn inject(text: &str, options: &InjectOptions) -> Result<(), String> {
     if text.is_empty() {
         return Ok(());
     }
@@ -116,7 +183,18 @@ pub fn inject(text: &str, options: InjectOptions) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn inject_windows(text: &str, options: InjectOptions) -> Result<(), String> {
+fn inject_windows(text: &str, options: &InjectOptions) -> Result<(), String> {
+    // A combo hotkey or paste-last shortcut may still be held: typed text
+    // would arrive as shortcuts (a newline as Ctrl+Enter sends a chat).
+    wait_for_modifiers_released(std::time::Duration::from_millis(MODIFIER_RELEASE_WAIT_MS));
+    if foreground_blocks_input() {
+        // Hand the text over instead of reporting a success that typed
+        // nothing. The user's own Ctrl+V is real input, which UIPI allows.
+        write_clipboard_unicode(text)?;
+        crate::logbuf::warn("Foreground app runs elevated; left the text on the clipboard.");
+        return Err(ELEVATED_TARGET.into());
+    }
+    let foreground = foreground_process_name();
     // Prefer SendInput so the default path never opens the clipboard.
     // Clipboard + Ctrl+V is the fallback (layout-independent, like VocaLinux
     // ydotool paste) and restores the previous clipboard unless the user
@@ -147,6 +225,7 @@ fn inject_windows(text: &str, options: InjectOptions) -> Result<(), String> {
                     Err(notepad_like_copy_to_clipboard_paste_failed(&clipboard_error))
                 }
                 CopyToClipboardPasteFailureDecision::TrySendInput => inject_send_input(text)
+                    .map_err(|failure| failure.message)
                     .and_then(|_| write_clipboard_unicode(text))
                     .map_err(|send_input_error| {
                         crate::logbuf::warn("Clipboard paste failed; SendInput also failed.");
@@ -157,24 +236,120 @@ fn inject_windows(text: &str, options: InjectOptions) -> Result<(), String> {
             },
         };
     }
-    if foreground_prefers_clipboard() {
+    if foreground.as_deref().is_some_and(prefers_clipboard_inject) {
         return inject_notepad_like(text);
+    }
+    if options.pastes_into(foreground.as_deref()) {
+        match inject_via_clipboard(text, true) {
+            Ok(()) => {
+                crate::logbuf::debug("Injected via clipboard (paste chosen for this app).");
+                return Ok(());
+            }
+            Err(error) => {
+                crate::logbuf::warn(format!("Paste failed ({error}); typing instead."));
+            }
+        }
     }
     match inject_send_input(text) {
         Ok(()) => {
             crate::logbuf::debug("Injected via SendInput.");
             Ok(())
         }
-        Err(send_input_error) => inject_via_clipboard(text, true)
+        // Part of the text is already in the app: pasting all of it again
+        // would duplicate what went in.
+        Err(failure) if failure.typed_any => Err(failure.message),
+        Err(failure) => inject_via_clipboard(text, true)
             .map(|()| {
                 crate::logbuf::warn("SendInput failed; fell back to clipboard paste.");
             })
             .map_err(|clipboard_error| {
                 crate::logbuf::error("SendInput and clipboard paste both failed.");
                 format!(
-                    "SendInput failed ({send_input_error}); clipboard paste also failed ({clipboard_error})"
+                    "SendInput failed ({}); clipboard paste also failed ({clipboard_error})",
+                    failure.message
                 )
             }),
+    }
+}
+
+/// Whether the foreground app runs at a higher integrity level than
+/// VocaWin (an app run as administrator while VocaWin is not). SendInput
+/// into it is dropped silently, so success cannot be detected afterwards.
+#[cfg(windows)]
+fn foreground_blocks_input() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let pid = unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return false;
+        }
+        let mut pid = 0u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        pid
+    };
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    let ours = current_integrity_level();
+    match process_integrity_level(pid) {
+        Some(theirs) => ours.is_some_and(|ours| theirs > ours),
+        // Same-user, same-level processes always allow this query; a refusal
+        // means the target sits above us, unless we are elevated ourselves.
+        None => ours.is_some_and(|ours| ours < HIGH_INTEGRITY_RID),
+    }
+}
+
+#[cfg(windows)]
+const HIGH_INTEGRITY_RID: u32 = 0x3000;
+
+#[cfg(windows)]
+fn current_integrity_level() -> Option<u32> {
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    token_integrity_level(unsafe { GetCurrentProcess() })
+}
+
+#[cfg(windows)]
+fn process_integrity_level(pid: u32) -> Option<u32> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let level = token_integrity_level(process);
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+    level
+}
+
+/// The mandatory-label RID of a process token (0x2000 medium, 0x3000 high).
+#[cfg(windows)]
+fn token_integrity_level(process: windows::Win32::Foundation::HANDLE) -> Option<u32> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
+        TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::OpenProcessToken;
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(process, TOKEN_QUERY, &mut token).ok()?;
+        let mut buffer = vec![0u8; 256];
+        let mut needed = 0u32;
+        let read = GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            Some(buffer.as_mut_ptr().cast()),
+            buffer.len() as u32,
+            &mut needed,
+        );
+        let _ = CloseHandle(token);
+        read.ok()?;
+        let label = &*(buffer.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        let sid = label.Label.Sid;
+        let count = *GetSidSubAuthorityCount(sid);
+        if count == 0 {
+            return None;
+        }
+        Some(*GetSidSubAuthority(sid, count as u32 - 1))
     }
 }
 
@@ -279,62 +454,108 @@ fn foreground_process_name() -> Option<String> {
     }
 }
 
+/// Why typing stopped. `typed_any` is set once some text already reached
+/// the app, so the caller must not paste the whole transcript again.
 #[cfg(windows)]
-fn inject_send_input(text: &str) -> Result<(), String> {
+struct SendInputFailure {
+    typed_any: bool,
+    message: String,
+}
+
+/// Type `text` as UNICODE key events, newlines as Enter, a few characters at
+/// a time. Each character's key-down/up pairs (two for a surrogate pair,
+/// such as an emoji) stay in one call.
+#[cfg(windows)]
+fn inject_send_input(text: &str) -> Result<(), SendInputFailure> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, VK_RETURN};
+    let groups = typing_groups(text);
+    let chunks: Vec<&[TypedKey]> = groups.chunks(TYPING_CHUNK_CHARS).collect();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let inputs: Vec<INPUT> = chunk
+            .iter()
+            .flat_map(|key| match key {
+                TypedKey::Enter => vec![key_down(VK_RETURN), key_up(VK_RETURN)],
+                TypedKey::Units(units) => units
+                    .iter()
+                    .flat_map(|unit| [unicode_key(*unit, false), unicode_key(*unit, true)])
+                    .collect(),
+            })
+            .collect();
+        let mut sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        if sent == 0 {
+            // Another thread's input can block the queue for a moment.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        }
+        if sent as usize != inputs.len() {
+            return Err(SendInputFailure {
+                typed_any: index > 0 || sent > 0,
+                message: if index > 0 || sent > 0 {
+                    "Windows stopped accepting typed input partway through".into()
+                } else {
+                    "Windows rejected SendInput".into()
+                },
+            });
+        }
+        if index + 1 < chunks.len() {
+            std::thread::sleep(std::time::Duration::from_millis(TYPING_CHUNK_PAUSE_MS));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn unicode_key(unit: u16, up: bool) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-        VIRTUAL_KEY, VK_RETURN,
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY,
     };
-    let mut inputs: Vec<INPUT> = Vec::new();
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: unit,
+                dwFlags: if up {
+                    KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                } else {
+                    KEYEVENTF_UNICODE
+                },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+/// One typed character: Enter for a line break (`\r\n`, `\r`, or `\n`), or
+/// the UTF-16 units of anything else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum TypedKey {
+    Enter,
+    Units(Vec<u16>),
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn typing_groups(text: &str) -> Vec<TypedKey> {
+    let mut groups = Vec::new();
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch == '\r' {
-            if chars.peek() == Some(&'\n') {
-                let _ = chars.next();
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                groups.push(TypedKey::Enter);
             }
-            inputs.extend([key_down(VK_RETURN), key_up(VK_RETURN)]);
-            continue;
-        }
-        if ch == '\n' {
-            inputs.extend([key_down(VK_RETURN), key_up(VK_RETURN)]);
-            continue;
-        }
-        let mut units = [0u16; 2];
-        for &unit in ch.encode_utf16(&mut units).iter() {
-            inputs.extend([
-                INPUT {
-                    r#type: INPUT_KEYBOARD,
-                    Anonymous: INPUT_0 {
-                        ki: KEYBDINPUT {
-                            wVk: VIRTUAL_KEY(0),
-                            wScan: unit,
-                            dwFlags: KEYEVENTF_UNICODE,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
-                    },
-                },
-                INPUT {
-                    r#type: INPUT_KEYBOARD,
-                    Anonymous: INPUT_0 {
-                        ki: KEYBDINPUT {
-                            wVk: VIRTUAL_KEY(0),
-                            wScan: unit,
-                            dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
-                    },
-                },
-            ]);
+            '\n' => groups.push(TypedKey::Enter),
+            _ => {
+                let mut units = [0u16; 2];
+                groups.push(TypedKey::Units(ch.encode_utf16(&mut units).to_vec()));
+            }
         }
     }
-    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if sent as usize == inputs.len() {
-        Ok(())
-    } else {
-        Err("Windows rejected SendInput".into())
-    }
+    groups
 }
 
 #[cfg(windows)]
@@ -576,8 +797,8 @@ fn inject_via_clipboard_inner(
         }
         return Err("Ctrl+V SendInput failed".into());
     }
-    // Match Mac TextInjector: give the target app time to consume Ctrl+V.
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    // Give the target app time to read the clipboard before it is restored.
+    std::thread::sleep(std::time::Duration::from_millis(PASTE_SETTLE_MS));
     if restore {
         restore_pending_clipboard(generation, Some(text));
     }
@@ -891,8 +1112,49 @@ mod tests {
     fn copy_to_clipboard_skips_restore() {
         let options = InjectOptions {
             copy_to_clipboard: true,
+            ..InjectOptions::default()
         };
         assert!(!options.restore_clipboard());
+    }
+
+    #[test]
+    fn paste_is_chosen_per_app_or_everywhere() {
+        let options = InjectOptions {
+            paste_apps: vec!["Slack".into(), "mstsc.exe".into()],
+            ..InjectOptions::default()
+        };
+        assert!(options.pastes_into(Some("slack.exe")));
+        assert!(options.pastes_into(Some("MSTSC.EXE")));
+        assert!(!options.pastes_into(Some("chrome.exe")));
+        assert!(!options.pastes_into(None));
+        let everywhere = InjectOptions {
+            paste_everywhere: true,
+            ..InjectOptions::default()
+        };
+        assert!(everywhere.pastes_into(Some("chrome.exe")));
+        assert!(everywhere.pastes_into(None));
+    }
+
+    #[test]
+    fn typing_keeps_emoji_whole_and_turns_line_breaks_into_enter() {
+        let groups = typing_groups("a🎉\r\nb\nc\r");
+        assert_eq!(
+            groups,
+            vec![
+                TypedKey::Units(vec!['a' as u16]),
+                TypedKey::Units(vec![0xD83C, 0xDF89]),
+                TypedKey::Enter,
+                TypedKey::Units(vec!['b' as u16]),
+                TypedKey::Enter,
+                TypedKey::Units(vec!['c' as u16]),
+                TypedKey::Enter,
+            ]
+        );
+        // Chunks split between characters, never inside a surrogate pair.
+        let long = "🎉".repeat(TYPING_CHUNK_CHARS * 2 + 1);
+        for chunk in typing_groups(&long).chunks(TYPING_CHUNK_CHARS) {
+            assert!(chunk.iter().all(|key| matches!(key, TypedKey::Units(units) if units.len() == 2)));
+        }
     }
 
     #[test]
@@ -1012,6 +1274,151 @@ mod tests {
                 && capture_failed.contains("copy text")
                 && capture_failed.contains("try again")
         );
+    }
+
+    /// Real Windows input: type and paste into a classic Edit control and a
+    /// RichEdit control (the two families most desktop apps build on), the
+    /// way a dictation reaches another app. Runs on the Windows CI runner.
+    /// Skips, with a note, when the session cannot give its window the
+    /// foreground (no interactive desktop): SendInput needs one.
+    #[cfg(windows)]
+    #[test]
+    fn typing_and_pasting_reach_real_windows_text_controls() {
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::System::LibraryLoader::LoadLibraryW;
+        use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
+            GetWindowTextLengthW, GetWindowTextW, PeekMessageW, SetForegroundWindow,
+            SetWindowTextW, ShowWindow, TranslateMessage, ES_AUTOVSCROLL, ES_MULTILINE, MSG,
+            PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        };
+
+        fn pump_for(duration: std::time::Duration) {
+            let deadline = std::time::Instant::now() + duration;
+            let mut msg = MSG::default();
+            while std::time::Instant::now() < deadline {
+                unsafe {
+                    while PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE).as_bool() {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        /// Run `work` on another thread while this one (the window's
+        /// thread) pumps the input it produces.
+        fn while_pumping<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+            let handle = std::thread::spawn(work);
+            while !handle.is_finished() {
+                pump_for(std::time::Duration::from_millis(20));
+            }
+            pump_for(std::time::Duration::from_millis(400));
+            handle.join().expect("injection thread panicked")
+        }
+
+        fn text_of(hwnd: HWND) -> String {
+            unsafe {
+                let length = GetWindowTextLengthW(hwnd).max(0) as usize;
+                let mut buffer = vec![0u16; length + 1];
+                let copied = GetWindowTextW(hwnd, &mut buffer).max(0) as usize;
+                String::from_utf16_lossy(&buffer[..copied])
+            }
+        }
+
+        fn focus(hwnd: HWND) -> bool {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = SetForegroundWindow(hwnd);
+                pump_for(std::time::Duration::from_millis(150));
+                let _ = SetFocus(hwnd);
+                GetForegroundWindow() == hwnd
+            }
+        }
+
+        let _ = unsafe { LoadLibraryW(w!("Msftedit.dll")) };
+        let classes: [(&str, PCWSTR); 2] = [("Edit", w!("EDIT")), ("RichEdit", w!("RICHEDIT50W"))];
+        for (name, class) in classes {
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    class,
+                    w!(""),
+                    WS_OVERLAPPEDWINDOW
+                        | WS_VISIBLE
+                        | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL) as u32),
+                    100,
+                    100,
+                    600,
+                    300,
+                    HWND::default(),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .unwrap_or_else(|error| panic!("could not create a {name} window: {error}"));
+            if !focus(hwnd) {
+                // GitHub's Windows runners have an interactive desktop, so a
+                // skip there would hide a regression: fail instead.
+                assert!(
+                    std::env::var_os("GITHUB_ACTIONS").is_none(),
+                    "{name}: could not take the foreground on the CI runner"
+                );
+                eprintln!("skipping {name}: this session cannot take the foreground");
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+                continue;
+            }
+
+            // Typing: accents, an emoji (a surrogate pair), a line break,
+            // and more than one chunk of characters.
+            let typed = format!("Héllo wörld 🎉\nline two {}", "x".repeat(60));
+            let sent = typed.clone();
+            while_pumping(move || inject_send_input(&sent).map_err(|f| f.message)).unwrap();
+            // Edit reports a line break as "\r\n", RichEdit as "\r".
+            let got = text_of(hwnd).replace("\r\n", "\n").replace('\r', "\n");
+            assert_eq!(got, typed, "{name}: typed text");
+
+            // Pasting restores what was on the clipboard before.
+            unsafe {
+                let _ = SetWindowTextW(hwnd, w!(""));
+            }
+            assert!(focus(hwnd), "{name}: focus lost");
+            write_clipboard_unicode("keep me").unwrap();
+            while_pumping(|| inject_via_clipboard("pasted text", true)).unwrap();
+            assert_eq!(text_of(hwnd), "pasted text", "{name}: pasted text");
+            assert_eq!(read_clipboard_unicode().unwrap(), "keep me", "{name}: clipboard restored");
+
+            // The public path with the default options types.
+            unsafe {
+                let _ = SetWindowTextW(hwnd, w!(""));
+            }
+            assert!(focus(hwnd), "{name}: focus lost");
+            while_pumping(|| inject("Default path ", &InjectOptions::default())).unwrap();
+            assert_eq!(text_of(hwnd), "Default path ", "{name}: default inject");
+            assert_eq!(read_clipboard_unicode().unwrap(), "keep me", "{name}: clipboard untouched");
+
+            // Paste chosen for every app goes through the clipboard.
+            unsafe {
+                let _ = SetWindowTextW(hwnd, w!(""));
+            }
+            assert!(focus(hwnd), "{name}: focus lost");
+            let paste = InjectOptions {
+                paste_everywhere: true,
+                ..InjectOptions::default()
+            };
+            while_pumping(move || inject("Pasted path", &paste)).unwrap();
+            assert_eq!(text_of(hwnd), "Pasted path", "{name}: paste everywhere");
+
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
     }
 
     #[test]

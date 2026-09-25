@@ -53,16 +53,21 @@ This is a tester build you can run today. It is not a store listing and not a st
 
 - **Hold a hotkey, speak, text at the caret** - Default is Right Alt, the same hold as VocaLinux. Double-tap toggles. You can change the hotkey in Settings.
 - **Tray** - Idle, recording, and processing icon states. Close goes to the tray. Show window / Quit.
-- **Settings** - Hotkeys, models, languages, silence detection, sounds, start on login.
+- **Settings** - Grouped pages with one search box: shortcuts, models, audio, formatting, dictionary, snippets, history, stats, and power. Export and import a settings backup.
 - **Local models** - In-app Download for Whisper/whisper.cpp, Distil-Whisper, Parakeet, Moonshine, SenseVoice, GigaAM, and Canary.
 - **GPU** - whisper.cpp on Vulkan with CPU fallback. ONNX Runtime on DirectML with CPU fallback.
 - **Clipboard stays yours.** Insertion types at the caret and does not replace what you copied. Turn on Copy to clipboard in Settings if you want the transcript left there. Clipboard paste is only a fallback, and that path restores the previous clipboard.
+- **More ways to dictate** - Escape cancels a take. A hands-free shortcut starts and stops without holding a key. A middle or side mouse button works like the hotkey. A paste-last shortcut types your last dictation again.
+- **On-screen pill** - A "VocaWin is ready" pill for a few seconds after launch, and a live level while you speak. It never takes focus.
+- **Text rules on this PC** - Removes "um" and "uh" and keeps only the fix when you correct yourself ("tomorrow, no, Wednesday"). Optional spoken numbers ("twenty three" → 23), symbols, and emoji ("party emoji" → 🎉). A personal dictionary and snippets work with every model. Numbers and emoji are English only.
+- **History and stats** - Search, copy, replay, and retry past takes. Audio is saved before transcribing, so a crash does not lose what you said. Usage stats with streaks and time saved. All local, with 1-day to forever retention.
+- **Audio** - Silence is trimmed before the model runs. Other apps can be muted while you record.
 
 ### Still rough
 
 - Unsigned. SmartScreen is expected. There is no purchased CA signature and no Microsoft Store listing.
 - The installer does not bundle a speech model. First run needs a network once to download one.
-- Elevated windows can block text injection.
+- Windows blocks typing into apps running as administrator. VocaWin then leaves the text on the clipboard and says so; press Ctrl+V.
 - Parakeet CTC and Vosk stay out of the catalog until they work.
 - No auto-update. Expect bugs. [File an issue](https://github.com/VocaHQ/vocawin/issues) if something breaks.
 

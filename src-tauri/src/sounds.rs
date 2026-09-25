@@ -150,6 +150,39 @@ pub fn play_error_if_enabled(theme: &str) {
     play_static_wav(error_wav());
 }
 
+/// Replay a saved history take (a WAV file on disk).
+pub fn play_file(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use windows::core::HSTRING;
+        use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT};
+        let wide = HSTRING::from(path.as_os_str());
+        let played = unsafe { PlaySoundW(&wide, None, SND_FILENAME | SND_ASYNC | SND_NODEFAULT) };
+        if played.as_bool() {
+            Ok(())
+        } else {
+            Err("Could not play the saved audio.".into())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("Audio playback is available in Windows builds only.".into())
+    }
+}
+
+/// Stop a replay started by `play_file`.
+pub fn stop_file() {
+    #[cfg(windows)]
+    {
+        use windows::core::PCWSTR;
+        use windows::Win32::Media::Audio::{PlaySoundW, SND_FLAGS};
+        unsafe {
+            let _ = PlaySoundW(PCWSTR::null(), None, SND_FLAGS(0));
+        }
+    }
+}
+
 /// Play one half of a pair without starting dictation. Rejects unknown ids.
 pub fn preview_theme(theme: &str, start: bool) -> Result<(), String> {
     let key = theme.trim().to_ascii_lowercase();

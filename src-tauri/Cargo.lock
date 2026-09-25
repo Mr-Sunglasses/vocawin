@@ -1252,6 +1252,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fancy-regex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e24cb5a94bcae1e5408b0effca5cd7172ea3c5755049c5f3af4cd283a165298"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5177,10 +5188,13 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vocawin"
 version = "0.1.1-beta"
 dependencies = [
+ "chrono",
  "cpal",
+ "fancy-regex",
  "flate2",
  "futures-util",
  "hound",
+ "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

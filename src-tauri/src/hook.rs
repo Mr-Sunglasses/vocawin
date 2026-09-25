@@ -15,6 +15,12 @@
 //! the consumed Alt. A different vk (Ctrl for AltGr) is fine. Do not
 //! SendInput from the hook callback; a synthetic unstick is queued on
 //! vocawin-hotkey-actor after a real bound-side up.
+//!
+//! The same hook also carries VocaMac's extra shortcuts: Escape cancels a
+//! live dictation (only while one is armed, so Escape reaches apps otherwise),
+//! and the hands-free and paste-last shortcuts fire once per press. A
+//! WH_MOUSE_LL hook is installed only while a mouse button is bound, so the
+//! middle or side buttons can dictate like the hotkey.
 
 #![allow(dead_code)] // Hook symbols are Windows-only; Linux CI still typechecks the module.
 
@@ -37,6 +43,15 @@ const WM_KEYDOWN: u32 = 0x0100;
 const WM_KEYUP: u32 = 0x0101;
 const WM_SYSKEYDOWN: u32 = 0x0104;
 const WM_SYSKEYUP: u32 = 0x0105;
+pub const VK_ESCAPE: u32 = 0x1B;
+const WH_MOUSE_LL: i32 = 14;
+const WM_MBUTTONDOWN: u32 = 0x0207;
+const WM_MBUTTONUP: u32 = 0x0208;
+const WM_XBUTTONDOWN: u32 = 0x020B;
+const WM_XBUTTONUP: u32 = 0x020C;
+const LLMHF_INJECTED: u32 = 0x01;
+/// Posted to the hook thread when the mouse binding changes.
+const WM_APP_MOUSE_BINDING: u32 = 0x8000 + 1;
 
 /// Mac uses max recording + 5s. Default max is 60s, so 65s.
 pub const DEFAULT_SAFETY_TIMEOUT: Duration = Duration::from_secs(65);
@@ -45,6 +60,42 @@ pub const DEFAULT_SAFETY_TIMEOUT: Duration = Duration::from_secs(65);
 pub enum HookEvent {
     Pressed,
     Released,
+    /// Escape while a dictation is armed for cancel, with that take's id,
+    /// so a late Escape can never throw away the take after it.
+    Cancel(u64),
+    /// Hands-free shortcut: start, or stop a running session.
+    HandsFree,
+    /// Type the last dictation again.
+    PasteLast,
+    MouseDown,
+    MouseUp,
+}
+
+/// A mouse button that can dictate like the hotkey.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseButton {
+    Middle,
+    X1,
+    X2,
+}
+
+impl MouseButton {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "middle" => Some(Self::Middle),
+            "x1" | "back" => Some(Self::X1),
+            "x2" | "forward" => Some(Self::X2),
+            _ => None,
+        }
+    }
+}
+
+/// What the hook does with a key before the hold logic sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpecialAction {
+    Pass,
+    Swallow,
+    Emit(HookEvent),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +148,15 @@ struct HookShared {
     session: HoldSession,
     hold_gen: u64,
     safety_timeout: Duration,
+    /// Hands-free and paste-last shortcuts.
+    actions: Vec<(HotkeySpec, HookEvent)>,
+    /// Keys of actions that fired and are still down (their up is eaten).
+    latched: Vec<u32>,
+    /// The take Escape cancels while it records or transcribes, if any.
+    cancel_armed: Option<u64>,
+    escape_swallowed: bool,
+    mouse_button: Option<MouseButton>,
+    mouse_held: bool,
 }
 
 enum ActorMsg {
@@ -108,6 +168,7 @@ enum ActorMsg {
 static SHARED: OnceLock<Mutex<HookShared>> = OnceLock::new();
 static HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
 static ACTOR_TX: OnceLock<mpsc::Sender<ActorMsg>> = OnceLock::new();
+static HOOK_THREAD_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn shared() -> &'static Mutex<HookShared> {
     SHARED.get_or_init(|| {
@@ -120,6 +181,12 @@ fn shared() -> &'static Mutex<HookShared> {
             session: HoldSession::Idle,
             hold_gen: 0,
             safety_timeout: DEFAULT_SAFETY_TIMEOUT,
+            actions: Vec::new(),
+            latched: Vec::new(),
+            cancel_armed: None,
+            escape_swallowed: false,
+            mouse_button: None,
+            mouse_held: false,
         })
     })
 }
@@ -197,7 +264,158 @@ pub fn set_dictation_paused(paused: bool) {
     guard.dictation_paused = paused;
 }
 
+/// Hands-free and paste-last bindings. Replaces the previous set.
+pub fn set_action_bindings(actions: Vec<(HotkeySpec, HookEvent)>) {
+    let mut guard = shared().lock().unwrap_or_else(|e| e.into_inner());
+    guard.actions = actions;
+    guard.latched.clear();
+}
+
+/// Arm Escape for take `session` while it records or transcribes, or disarm
+/// with `None`. Disarming leaves an Escape that is already down swallowed
+/// until it comes up.
+pub fn set_cancel_armed(session: Option<u64>) {
+    let mut guard = shared().lock().unwrap_or_else(|e| e.into_inner());
+    guard.cancel_armed = session;
+}
+
+/// Disarm Escape only if it is still armed for `session`: a newer take may
+/// have armed it for itself meanwhile.
+pub fn disarm_cancel_for(session: u64) {
+    let mut guard = shared().lock().unwrap_or_else(|e| e.into_inner());
+    if guard.cancel_armed == Some(session) {
+        guard.cancel_armed = None;
+    }
+}
+
+/// Bind a mouse button, or `None` to release it and remove the mouse hook.
+pub fn set_mouse_button(button: Option<MouseButton>) {
+    {
+        let mut guard = shared().lock().unwrap_or_else(|e| e.into_inner());
+        guard.mouse_button = button;
+        if button.is_none() {
+            guard.mouse_held = false;
+        }
+    }
+    let thread = HOOK_THREAD_ID.load(Ordering::SeqCst);
+    if thread != 0 {
+        post_mouse_binding_changed(thread);
+    }
+}
+
+#[cfg(windows)]
+fn post_mouse_binding_changed(thread: u32) {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
+    unsafe {
+        let _ = PostThreadMessageW(thread, WM_APP_MOUSE_BINDING, WPARAM(0), LPARAM(0));
+    }
+}
+
+#[cfg(not(windows))]
+fn post_mouse_binding_changed(_thread: u32) {}
+
+/// Escape handling, decided before the hold logic sees the key.
+fn escape_action(
+    guard: &mut HookShared,
+    vk: u32,
+    edge: KeyEdge,
+) -> SpecialAction {
+    if vk != VK_ESCAPE {
+        return SpecialAction::Pass;
+    }
+    match edge {
+        KeyEdge::Down if guard.escape_swallowed => SpecialAction::Swallow,
+        KeyEdge::Down if guard.cancel_armed.is_some() && !guard.capture_paused => {
+            guard.escape_swallowed = true;
+            let session = guard.cancel_armed.take().unwrap_or_default();
+            SpecialAction::Emit(HookEvent::Cancel(session))
+        }
+        KeyEdge::Up if guard.escape_swallowed => {
+            guard.escape_swallowed = false;
+            SpecialAction::Swallow
+        }
+        _ => SpecialAction::Pass,
+    }
+}
+
+/// Hands-free / paste-last: fire once on the first down, eat repeats and the
+/// matching up. `matches` decides whether a binding's key and modifiers are
+/// down (GetAsyncKeyState on Windows).
+fn shortcut_action(
+    guard: &mut HookShared,
+    vk: u32,
+    edge: KeyEdge,
+    matches: impl Fn(&HotkeySpec, u32) -> bool,
+) -> SpecialAction {
+    match edge {
+        KeyEdge::Down => {
+            if guard.latched.contains(&vk) {
+                return SpecialAction::Swallow;
+            }
+            if guard.capture_paused || guard.dictation_paused || !guard.listener_enabled {
+                return SpecialAction::Pass;
+            }
+            let hit = guard
+                .actions
+                .iter()
+                .find(|(spec, _)| matches(spec, vk))
+                .map(|(_, event)| *event);
+            match hit {
+                Some(event) => {
+                    guard.latched.push(vk);
+                    SpecialAction::Emit(event)
+                }
+                None => SpecialAction::Pass,
+            }
+        }
+        KeyEdge::Up => {
+            if let Some(position) = guard.latched.iter().position(|held| *held == vk) {
+                guard.latched.remove(position);
+                SpecialAction::Swallow
+            } else {
+                SpecialAction::Pass
+            }
+        }
+        KeyEdge::Other => SpecialAction::Pass,
+    }
+}
+
+/// Mouse button edge → what to do with it. Only the bound button is touched,
+/// and a paused listener lets every click through.
+fn mouse_action(guard: &mut HookShared, button: MouseButton, down: bool) -> SpecialAction {
+    if guard.mouse_button != Some(button) {
+        return SpecialAction::Pass;
+    }
+    if down {
+        if guard.capture_paused || guard.dictation_paused || !guard.listener_enabled {
+            return SpecialAction::Pass;
+        }
+        guard.mouse_held = true;
+        SpecialAction::Emit(HookEvent::MouseDown)
+    } else if guard.mouse_held {
+        guard.mouse_held = false;
+        SpecialAction::Emit(HookEvent::MouseUp)
+    } else {
+        SpecialAction::Pass
+    }
+}
+
 fn emit(event: HookEvent) {
+    // Cancel must not wait behind the actor: it may be busy transcribing the
+    // take Escape is meant to stop, and would only see Cancel after typing.
+    if let HookEvent::Cancel(_) = event {
+        let app = shared()
+            .lock()
+            .map(|guard| guard.app.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().app.clone());
+        if let Some(app) = app {
+            let _ = std::thread::Builder::new()
+                .name("vocawin-cancel".into())
+                .spawn(move || crate::on_hotkey_event(&app, event));
+        }
+        return;
+    }
     if let Some(tx) = ACTOR_TX.get() {
         let _ = tx.send(ActorMsg::Event(event));
     }
@@ -238,9 +456,10 @@ fn bump_hold_gen(guard: &mut HookShared) -> u64 {
 fn hook_thread_main() -> Result<(), String> {
     use windows::Win32::Foundation::HINSTANCE;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-        MSG, WINDOWS_HOOK_ID,
+        HHOOK, MSG, WINDOWS_HOOK_ID,
     };
 
     unsafe {
@@ -253,12 +472,49 @@ fn hook_thread_main() -> Result<(), String> {
         )
         .map_err(|error| format!("Could not install keyboard hook: {error}"))?;
 
+        // A mouse hook sees every mouse move system-wide, so it is only
+        // installed while a button is bound.
+        let mut mouse_hook: Option<HHOOK> = None;
+        let reconcile_mouse = |mouse_hook: &mut Option<HHOOK>| {
+            let wanted = shared()
+                .lock()
+                .map(|guard| guard.mouse_button.is_some())
+                .unwrap_or(false);
+            if wanted && mouse_hook.is_none() {
+                match SetWindowsHookExW(
+                    WINDOWS_HOOK_ID(WH_MOUSE_LL),
+                    Some(mouse_proc),
+                    HINSTANCE(module.0),
+                    0,
+                ) {
+                    Ok(handle) => *mouse_hook = Some(handle),
+                    Err(error) => {
+                        crate::logbuf::error(format!("Could not install mouse hook: {error}"))
+                    }
+                }
+            } else if !wanted {
+                if let Some(handle) = mouse_hook.take() {
+                    let _ = UnhookWindowsHookEx(handle);
+                }
+            }
+        };
+        HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
+        reconcile_mouse(&mut mouse_hook);
+
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, windows::Win32::Foundation::HWND::default(), 0, 0).into() {
+            if msg.hwnd.0.is_null() && msg.message == WM_APP_MOUSE_BINDING {
+                reconcile_mouse(&mut mouse_hook);
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
 
+        HOOK_THREAD_ID.store(0, Ordering::SeqCst);
+        if let Some(handle) = mouse_hook.take() {
+            let _ = UnhookWindowsHookEx(handle);
+        }
         let _ = UnhookWindowsHookEx(hook);
     }
     Ok(())
@@ -299,6 +555,25 @@ unsafe extern "system" fn low_level_proc(
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+
+        match escape_action(&mut guard, vk, edge) {
+            SpecialAction::Pass => {}
+            SpecialAction::Swallow => return LRESULT(1),
+            SpecialAction::Emit(event) => {
+                drop(guard);
+                emit(event);
+                return LRESULT(1);
+            }
+        }
+        match shortcut_action(&mut guard, vk, edge, down_matches) {
+            SpecialAction::Pass => {}
+            SpecialAction::Swallow => return LRESULT(1),
+            SpecialAction::Emit(event) => {
+                drop(guard);
+                emit(event);
+                return LRESULT(1);
+            }
+        }
 
         let altgr_blocks = edge == KeyEdge::Down
             && matches!(guard.binding, Some(HotkeySpec::Lone { vk: bound }) if bound == crate::hotkey::VK_RMENU)
@@ -358,6 +633,59 @@ unsafe extern "system" fn low_level_proc(
     }
 
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn mouse_proc(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::UI::WindowsAndMessaging::{CallNextHookEx, MSLLHOOKSTRUCT};
+
+    if code < 0 {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+    let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+    if info.flags & LLMHF_INJECTED != 0 {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    }
+    let Some((button, down)) = mouse_edge(wparam.0 as u32, info.mouseData) else {
+        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    };
+    let action = {
+        let mut guard = match shared().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        mouse_action(&mut guard, button, down)
+    };
+    match action {
+        SpecialAction::Pass => unsafe { CallNextHookEx(None, code, wparam, lparam) },
+        SpecialAction::Swallow => LRESULT(1),
+        SpecialAction::Emit(event) => {
+            emit(event);
+            LRESULT(1)
+        }
+    }
+}
+
+/// Which button a mouse message is about, and whether it went down.
+fn mouse_edge(message: u32, mouse_data: u32) -> Option<(MouseButton, bool)> {
+    match message {
+        WM_MBUTTONDOWN => Some((MouseButton::Middle, true)),
+        WM_MBUTTONUP => Some((MouseButton::Middle, false)),
+        WM_XBUTTONDOWN | WM_XBUTTONUP => {
+            let button = match (mouse_data >> 16) & 0xFFFF {
+                1 => MouseButton::X1,
+                2 => MouseButton::X2,
+                _ => return None,
+            };
+            Some((button, message == WM_XBUTTONDOWN))
+        }
+        _ => None,
+    }
 }
 
 fn classify_edge(wparam: u32, flags: u32) -> KeyEdge {
@@ -703,6 +1031,102 @@ mod tests {
         assert_eq!(apply(idle(), VK_LMENU, KeyEdge::Down), HoldAction::None);
         assert!(!down_matches(&binding, VK_LMENU));
         assert!(down_matches(&binding, VK_RMENU) || cfg!(not(windows)));
+    }
+
+    fn test_shared() -> HookShared {
+        HookShared {
+            app: None,
+            binding: Some(right_alt()),
+            capture_paused: false,
+            dictation_paused: false,
+            listener_enabled: true,
+            session: HoldSession::Idle,
+            hold_gen: 0,
+            safety_timeout: DEFAULT_SAFETY_TIMEOUT,
+            actions: Vec::new(),
+            latched: Vec::new(),
+            cancel_armed: None,
+            escape_swallowed: false,
+            mouse_button: None,
+            mouse_held: false,
+        }
+    }
+
+    #[test]
+    fn escape_passes_through_unless_armed() {
+        let mut shared = test_shared();
+        assert_eq!(escape_action(&mut shared, VK_ESCAPE, KeyEdge::Down), SpecialAction::Pass);
+        assert_eq!(escape_action(&mut shared, VK_ESCAPE, KeyEdge::Up), SpecialAction::Pass);
+    }
+
+    #[test]
+    fn armed_escape_cancels_once_and_eats_its_up() {
+        let mut shared = test_shared();
+        shared.cancel_armed = Some(7);
+        assert_eq!(
+            escape_action(&mut shared, VK_ESCAPE, KeyEdge::Down),
+            SpecialAction::Emit(HookEvent::Cancel(7))
+        );
+        // Typematic repeats and the up are eaten; nothing fires twice.
+        assert_eq!(escape_action(&mut shared, VK_ESCAPE, KeyEdge::Down), SpecialAction::Swallow);
+        assert_eq!(escape_action(&mut shared, VK_ESCAPE, KeyEdge::Up), SpecialAction::Swallow);
+        assert_eq!(escape_action(&mut shared, VK_ESCAPE, KeyEdge::Down), SpecialAction::Pass);
+        assert_eq!(escape_action(&mut shared, 0x41, KeyEdge::Down), SpecialAction::Pass);
+    }
+
+    #[test]
+    fn escape_is_left_alone_while_recording_a_hotkey() {
+        let mut shared = test_shared();
+        shared.cancel_armed = Some(7);
+        shared.capture_paused = true;
+        assert_eq!(escape_action(&mut shared, VK_ESCAPE, KeyEdge::Down), SpecialAction::Pass);
+    }
+
+    #[test]
+    fn shortcuts_fire_once_per_press() {
+        let mut shared = test_shared();
+        shared.actions = vec![(HotkeySpec::Lone { vk: crate::hotkey::VK_F9 }, HookEvent::HandsFree)];
+        let matches = |spec: &HotkeySpec, vk: u32| matches!(spec, HotkeySpec::Lone { vk: bound } if *bound == vk);
+        let f9 = crate::hotkey::VK_F9;
+        assert_eq!(
+            shortcut_action(&mut shared, f9, KeyEdge::Down, matches),
+            SpecialAction::Emit(HookEvent::HandsFree)
+        );
+        assert_eq!(shortcut_action(&mut shared, f9, KeyEdge::Down, matches), SpecialAction::Swallow);
+        assert_eq!(shortcut_action(&mut shared, f9, KeyEdge::Up, matches), SpecialAction::Swallow);
+        assert_eq!(shortcut_action(&mut shared, f9, KeyEdge::Up, matches), SpecialAction::Pass);
+        assert_eq!(shortcut_action(&mut shared, 0x41, KeyEdge::Down, matches), SpecialAction::Pass);
+        shared.dictation_paused = true;
+        assert_eq!(shortcut_action(&mut shared, f9, KeyEdge::Down, matches), SpecialAction::Pass);
+    }
+
+    #[test]
+    fn only_the_bound_mouse_button_dictates() {
+        let mut shared = test_shared();
+        assert_eq!(mouse_action(&mut shared, MouseButton::Middle, true), SpecialAction::Pass);
+        shared.mouse_button = Some(MouseButton::X1);
+        assert_eq!(mouse_action(&mut shared, MouseButton::Middle, true), SpecialAction::Pass);
+        assert_eq!(
+            mouse_action(&mut shared, MouseButton::X1, true),
+            SpecialAction::Emit(HookEvent::MouseDown)
+        );
+        assert_eq!(
+            mouse_action(&mut shared, MouseButton::X1, false),
+            SpecialAction::Emit(HookEvent::MouseUp)
+        );
+        assert_eq!(mouse_action(&mut shared, MouseButton::X1, false), SpecialAction::Pass);
+        shared.dictation_paused = true;
+        assert_eq!(mouse_action(&mut shared, MouseButton::X1, true), SpecialAction::Pass);
+    }
+
+    #[test]
+    fn mouse_messages_map_to_buttons() {
+        assert_eq!(mouse_edge(WM_MBUTTONDOWN, 0), Some((MouseButton::Middle, true)));
+        assert_eq!(mouse_edge(WM_XBUTTONUP, 2 << 16), Some((MouseButton::X2, false)));
+        assert_eq!(mouse_edge(WM_XBUTTONDOWN, 1 << 16), Some((MouseButton::X1, true)));
+        assert_eq!(mouse_edge(0x0201, 0), None);
+        assert_eq!(MouseButton::parse("X2"), Some(MouseButton::X2));
+        assert_eq!(MouseButton::parse(""), None);
     }
 
     #[test]
