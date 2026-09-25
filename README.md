@@ -67,7 +67,7 @@ This is a tester build you can run today. It is not a store listing and not a st
 
 - Unsigned. SmartScreen is expected. There is no purchased CA signature and no Microsoft Store listing.
 - The installer does not bundle a speech model. First run needs a network once to download one.
-- Elevated windows can block text injection.
+- Windows blocks typing into apps running as administrator. VocaWin then leaves the text on the clipboard and says so; press Ctrl+V.
 - Parakeet CTC and Vosk stay out of the catalog until they work.
 - No auto-update. Expect bugs. [File an issue](https://github.com/VocaHQ/vocawin/issues) if something breaks.
 

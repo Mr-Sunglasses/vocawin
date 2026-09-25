@@ -14,6 +14,8 @@ Hold Right Alt to dictate, the same hold-default as VocaLinux. AltGr is left alo
 
 A small pill shows at the bottom of the screen for a few seconds after VocaWin starts, since Windows often hides new tray icons. The same pill shows a live level while you speak and a spinner while a take is transcribed. It never takes focus from the app you are typing into. Turn either off in General.
 
+Text is typed at the caret, a few characters at a time, and your clipboard is left alone. If an app drops or garbles typed text, add it under Formatting, Always paste in these apps (or switch How text goes in to Paste): VocaWin pastes there and puts your clipboard back afterwards. Apps running as administrator block input from VocaWin; the text is left on the clipboard instead, so press Ctrl+V.
+
 The tray mic is teal when idle, red while you speak, amber while a take is processing, and slate when the model is unloaded or paused.
 
 The window title and the sidebar pill say Beta. That means this is a tester build, not a store ship.

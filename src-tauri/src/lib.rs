@@ -309,6 +309,14 @@ struct Settings {
     /// Keep recent takes' audio for replay and retry.
     #[serde(default = "default_true")]
     history_keep_audio: bool,
+    /// `type` (SendInput, clipboard untouched) or `paste` (clipboard paste,
+    /// then the previous clipboard is restored).
+    #[serde(default = "default_insertion_mode")]
+    insertion_mode: String,
+    /// Newline/comma separated process names that always get a paste: apps
+    /// that drop typed characters.
+    #[serde(default)]
+    paste_apps: String,
 }
 
 fn default_true() -> bool {
@@ -329,6 +337,10 @@ fn default_overlay_position() -> String {
 
 fn default_history_retention_days() -> u32 {
     30
+}
+
+fn default_insertion_mode() -> String {
+    "type".into()
 }
 
 fn default_max_recording_seconds() -> f32 {
@@ -380,6 +392,8 @@ impl Default for Settings {
             mute_other_audio: false,
             history_retention_days: default_history_retention_days(),
             history_keep_audio: true,
+            insertion_mode: default_insertion_mode(),
+            paste_apps: String::new(),
         }
     }
 }
@@ -1275,6 +1289,9 @@ fn normalize_extra_settings(settings: &mut Settings) -> Result<(), String> {
     }
     if !matches!(settings.mouse_button.as_str(), "" | "middle" | "x1" | "x2") {
         return Err("Mouse button must be middle, x1, x2, or none".into());
+    }
+    if !matches!(settings.insertion_mode.as_str(), "type" | "paste") {
+        return Err("Text must be typed or pasted".into());
     }
     if !matches!(settings.history_retention_days, 0 | 1 | 7 | 30) {
         return Err("Keep history for 1, 7, or 30 days, or forever".into());
@@ -3002,21 +3019,31 @@ fn list_running_apps() -> Vec<autopause::RunningApp> {
 }
 
 fn inject_transcript(state: &AppState, text: &str) -> Result<(), String> {
-    let copy_to_clipboard = state
+    let options = state
         .settings
         .lock()
-        .map(|settings| settings.copy_to_clipboard)
-        .unwrap_or(false);
+        .map(|settings| inject_options(&settings))
+        .unwrap_or_default();
     logbuf::debug(format!(
-        "Inject {} chars (copy_to_clipboard={copy_to_clipboard})",
-        text.chars().count()
+        "Inject {} chars (copy_to_clipboard={}, paste_everywhere={})",
+        text.chars().count(),
+        options.copy_to_clipboard,
+        options.paste_everywhere
     ));
-    match output::inject(text, output::InjectOptions { copy_to_clipboard }) {
+    match output::inject(text, &options) {
         Ok(()) => Ok(()),
         Err(error) => {
             logbuf::error(format!("Inject failed: {error}"));
             Err(error)
         }
+    }
+}
+
+fn inject_options(settings: &Settings) -> output::InjectOptions {
+    output::InjectOptions {
+        copy_to_clipboard: settings.copy_to_clipboard,
+        paste_everywhere: settings.insertion_mode == "paste",
+        paste_apps: autopause::parse_app_list(&settings.paste_apps),
     }
 }
 
@@ -4345,6 +4372,8 @@ mod tests {
         assert_eq!(settings.history_retention_days, 30);
         assert!(!settings.numbers_as_digits && !settings.spoken_emoji && !settings.mute_other_audio);
         assert!(settings.hands_free_hotkey.is_empty() && settings.paste_last_hotkey.is_empty());
+        assert_eq!(settings.insertion_mode, "type");
+        assert!(inject_options(&settings).paste_apps.is_empty());
         // A file missing a field once required still loads the rest.
         let partial: Settings = serde_json::from_str(r#"{"language":"German"}"#).unwrap();
         assert_eq!(partial.language, "German");

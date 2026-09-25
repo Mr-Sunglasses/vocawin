@@ -55,6 +55,8 @@ type Settings = {
   muteOtherAudio: boolean;
   historyRetentionDays: number;
   historyKeepAudio: boolean;
+  insertionMode: string;
+  pasteApps: string;
 };
 type Replacement = { heard: string; replacement: string };
 type Snippet = { trigger: string; expansion: string };
@@ -690,10 +692,10 @@ function chipLabel(name: string) {
     ?? name.replace(/\.exe$/i, "");
 }
 
-function runningAppOptions() {
-  const watched = new Set(watchedApps().map(name => name.toLowerCase()));
+function appPickerOptions(chosen: string[]) {
+  const taken = new Set(chosen.map(name => name.toLowerCase()));
   const options = runningApps
-    .filter(app => !watched.has(app.name.toLowerCase()))
+    .filter(app => !taken.has(app.name.toLowerCase()))
     .map(app => `<option value="${escape(app.name)}">${escape(app.label)}</option>`);
   if (!options.length) {
     return `<option value="">No other running apps right now</option>`;
@@ -701,10 +703,24 @@ function runningAppOptions() {
   return `<option value="">Add a running app</option>${options.join("")}`;
 }
 
-function watchedAppChips() {
-  const apps = watchedApps();
+function runningAppOptions() {
+  return appPickerOptions(watchedApps());
+}
+
+function appChips(apps: string[], action: string) {
   if (!apps.length) return "";
-  return `<ul class="app-chips">${apps.map(name => `<li class="app-chip"><span>${escape(chipLabel(name))}</span><button type="button" data-unwatch="${escape(name)}" title="Remove ${escape(chipLabel(name))}" aria-label="Remove ${escape(chipLabel(name))}">×</button></li>`).join("")}</ul>`;
+  return `<ul class="app-chips">${apps.map(name => `<li class="app-chip"><span>${escape(chipLabel(name))}</span><button type="button" data-${action}="${escape(name)}" title="Remove ${escape(chipLabel(name))}" aria-label="Remove ${escape(chipLabel(name))}">×</button></li>`).join("")}</ul>`;
+}
+
+function watchedAppChips() {
+  return appChips(watchedApps(), "unwatch");
+}
+
+function pasteApps() {
+  return (settings.pasteApps ?? "")
+    .split(/[\n,;]+/)
+    .map(part => part.trim())
+    .filter(Boolean);
 }
 
 function idleUnloadValue() {
@@ -942,6 +958,23 @@ function settingsItems(): SettingsItem[] {
       subtitle: "Say “party emoji” for 🎉 or “three fire emojis” for 🔥🔥🔥. Talking about one (“send a fire emoji”) keeps the words.",
       keywords: "emoji emoticon smiley",
       html: switchControl("spoken-emoji", settings.spokenEmoji),
+    },
+    {
+      page: "formatting",
+      card: "Output",
+      title: "How text goes in",
+      subtitle: "Typing works in almost every app and leaves your clipboard alone. Paste is faster for long text and suits apps that drop typed characters; your clipboard is put back afterwards.",
+      keywords: "type paste insert injection sendinput clipboard method",
+      html: selectControl("insertion-mode", [["type", "Type at the caret"], ["paste", "Paste"]], settings.insertionMode),
+    },
+    {
+      page: "formatting",
+      card: "Output",
+      title: "Always paste in these apps",
+      subtitle: "For an app where typed text comes out wrong or incomplete. Notepad and WordPad always paste.",
+      keywords: "paste apps dropped characters remote desktop terminal electron",
+      html: `<select id="paste-app" class="themed-select power-combo">${appPickerOptions(pasteApps())}</select>`,
+      after: `<div class="power-chips"><div id="paste-app-chips">${appChips(pasteApps(), "unpaste")}</div><p class="power-note">Empty list means type everywhere (unless Paste is chosen above).</p></div>`,
     },
     {
       page: "formatting",
@@ -1579,7 +1612,7 @@ function openView(next: View) {
     settingsQuery = "";
     pageBeforeSearch = null;
   }
-  if (next === "power") {
+  if (next === "power" || next === "formatting") {
     void Promise.all([refreshRunningApps(), refreshRuntime()]).then(render);
     return;
   }
@@ -1629,6 +1662,16 @@ function bindChrome() {
   }));
   bindPageActions();
   bindOnboarding();
+  document.querySelector<HTMLSelectElement>("#paste-app")?.addEventListener("change", event => {
+    const name = (event.target as HTMLSelectElement).value.trim();
+    if (!name || pasteApps().some(app => app.toLowerCase() === name.toLowerCase())) return;
+    settings.pasteApps = [...pasteApps(), name].join("\n");
+    void persistSettings(true, true).then(render);
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-unpaste]").forEach(button => button.addEventListener("click", () => {
+    settings.pasteApps = pasteApps().filter(app => app !== button.dataset.unpaste).join("\n");
+    void persistSettings(true, true).then(render);
+  }));
   const soundTheme = document.querySelector<HTMLSelectElement>("#sound-theme");
   const previewSound = document.querySelector<HTMLButtonElement>("#preview-sound");
   previewSound?.addEventListener("click", async () => {
@@ -1710,7 +1753,7 @@ function bindFilterCombo(selector: string, options: Array<[string, string]>, ass
 function bindAutosave() {
   const persistFromEvent = (event: Event) => {
     const target = event.target as HTMLElement;
-    if (target.id === "settings-search" || target.id === "model-search" || target.id === "engine-filter" || target.id === "language-filter" || target.id === "auto-pause-app") return;
+    if (target.id === "settings-search" || target.id === "model-search" || target.id === "engine-filter" || target.id === "language-filter" || target.id === "auto-pause-app" || target.id === "paste-app") return;
     if (target.classList.contains("draft")) return;
     void persistSettings();
   };
@@ -1772,6 +1815,7 @@ function collectSettingsFromDom() {
   const customVocabulary = document.querySelector<HTMLTextAreaElement>("#custom-vocabulary");
   if (customVocabulary) settings.customVocabulary = customVocabulary.value;
   const pick = (id: string) => document.querySelector<HTMLSelectElement>(`#${id}`)?.value;
+  settings.insertionMode = pick("insertion-mode") ?? settings.insertionMode;
   const checked = (id: string) => document.querySelector<HTMLInputElement>(`#${id}`)?.checked;
   settings.handsFreeHotkey = pick("hands-free-hotkey") ?? settings.handsFreeHotkey;
   settings.pasteLastHotkey = pick("paste-last-hotkey") ?? settings.pasteLastHotkey;
@@ -2453,6 +2497,8 @@ Promise.all([
     muteOtherAudio: saved.muteOtherAudio ?? false,
     historyRetentionDays: saved.historyRetentionDays ?? 30,
     historyKeepAudio: saved.historyKeepAudio ?? true,
+    insertionMode: saved.insertionMode ?? "type",
+    pasteApps: saved.pasteApps ?? "",
   };
   statuses = installs;
   history = entries;
