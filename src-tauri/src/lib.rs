@@ -2185,9 +2185,9 @@ fn transcribe_onnx(
 ///
 /// Moonshine also returns nothing for a window that opens on a second or
 /// more of pause (a pause too long for a cut to reach past, or any take with
-/// Skip Silence off). A window that decodes to nothing is decoded again from
-/// each place its speech may start, earliest first, until one gives text;
-/// it had no text to lose.
+/// Skip Silence off). A window that decodes to nothing is decoded once more
+/// with its long pauses shortened and every sound kept; it had no text to
+/// lose.
 fn decode_in_windows(
     pcm: &[f32],
     mut decode: impl FnMut(&[f32]) -> Result<String, String>,
@@ -2201,12 +2201,11 @@ fn decode_in_windows(
         let window = &pcm[range];
         let mut text = decode(window)?;
         if text.trim().is_empty() {
-            for start in chunking::speech_starts(window) {
-                logbuf::debug("A window decoded to nothing; decoding it again from its speech.");
-                text = decode(&window[start..])?;
-                if !text.trim().is_empty() {
-                    break;
-                }
+            if let Some(shortened) = chunking::without_long_pauses(window) {
+                logbuf::debug(
+                    "A window decoded to nothing; decoding it again with its pauses shortened.",
+                );
+                text = decode(&shortened)?;
             }
         }
         let text = text.trim();
@@ -3945,20 +3944,20 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_window_is_retried_from_each_speech_start_in_turn() {
-        // 0.5 s of pause, a click, 1 s more pause, then speech. Like
-        // Moonshine, the stub returns nothing for audio that opens on half a
-        // second or more of quiet, and a click counts as quiet.
-        let quiet_opening =
-            |window: &[f32]| window[..8_000].iter().filter(|s| s.abs() >= 0.1).count() < 1_000;
+    fn an_empty_window_is_decoded_again_with_its_pauses_shortened() {
+        // 0.8 s of pause, a click, 1 s more pause, then speech. The stub,
+        // like Moonshine, returns nothing for audio that opens on half a
+        // second or more of pause.
+        let opens_on_pause =
+            |window: &[f32]| window.iter().position(|s| s.abs() >= 0.1) >= Some(8_000);
         let mut pcm = vec![0.0; 8_000 + 4_800];
         pcm.extend(vec![1.0; 480]);
         pcm.extend(vec![0.0; 16_000]);
         pcm.extend((0..16_000 * 3).map(|i| (i as f32 * 0.07).sin() * 0.3));
-        let mut lengths = Vec::new();
+        let mut decoded = Vec::new();
         let text = decode_in_windows(&pcm, |window| {
-            lengths.push(window.len());
-            Ok(if quiet_opening(window) {
+            decoded.push(window.to_vec());
+            Ok(if opens_on_pause(window) {
                 String::new()
             } else {
                 "speech".into()
@@ -3966,12 +3965,12 @@ mod tests {
         })
         .unwrap();
         assert_eq!(text, "speech");
-        // The whole take, from just before the click, from just before the
-        // speech.
-        assert_eq!(lengths.len(), 3, "{lengths:?}");
-        assert_eq!(lengths[0], pcm.len());
-        assert!(lengths[1] < lengths[0] && lengths[2] < lengths[1]);
-        assert!(lengths[2] <= 16_000 * 3 + 3_200 + 480, "{lengths:?}");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0], pcm);
+        // The retry keeps the click and all of the speech.
+        let loud = |audio: &[f32]| audio.iter().filter(|s| s.abs() >= 0.1).count();
+        assert_eq!(loud(&decoded[1]), loud(&pcm));
+        assert!(decoded[1].len() < pcm.len());
 
         // Text on the first pass: no second one.
         let mut calls = 0;
