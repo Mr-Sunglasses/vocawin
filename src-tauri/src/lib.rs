@@ -2584,16 +2584,17 @@ fn onnx_uses_directml(model_id: &str) -> bool {
     )
 }
 
-/// Set after DirectML fails once, so later takes in this run go straight to
-/// CPU instead of failing on the GPU first every time.
+/// Set once DirectML has failed a take that CPU then decoded, so later takes
+/// in this run go straight to CPU instead of failing on the GPU first.
 static DIRECTML_FAILED: AtomicBool = AtomicBool::new(false);
-/// The ONNX Runtime accelerator is process-wide in transcribe-rs and read
-/// when a model loads, so one ONNX decode runs at a time (a history retry
-/// can overlap a live take).
-static ONNX_DECODE: Mutex<()> = Mutex::new(());
 
 /// `transcribe_onnx` on DirectML when the model and the PC support it, and
 /// on CPU when they do not or DirectML fails.
+///
+/// transcribe-rs keeps the accelerator in one process-wide setting that it
+/// reads when a model loads. A history retry can overlap a live take, but
+/// both decode the selected model and so ask for the same setting; the
+/// rare overlap around a DirectML failure can only put a take on CPU.
 fn transcribe_onnx_accelerated(
     model_id: &str,
     models_path: &Path,
@@ -2602,28 +2603,47 @@ fn transcribe_onnx_accelerated(
 ) -> Result<String, String> {
     use transcribe_rs::accel::{set_ort_accelerator, OrtAccelerator};
 
-    let _decode = ONNX_DECODE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let directml = cfg!(windows)
         && onnx_uses_directml(model_id)
         && model_is_installed(models_path, model_id)
         && !DIRECTML_FAILED.load(Ordering::Relaxed)
         && gpu::detect_gpu().available;
-    if directml {
-        set_ort_accelerator(OrtAccelerator::DirectMl);
-        match transcribe_onnx(model_id, models_path, pcm, language) {
-            Ok(text) => return Ok(text),
-            Err(error) => {
-                DIRECTML_FAILED.store(true, Ordering::Relaxed);
-                logbuf::warn(format!(
-                    "DirectML failed for {model_id}; using CPU from now on: {error}"
-                ));
-            }
-        }
+    let (result, directml_broken) = decode_with_cpu_fallback(directml, |gpu| {
+        set_ort_accelerator(if gpu {
+            OrtAccelerator::DirectMl
+        } else {
+            OrtAccelerator::CpuOnly
+        });
+        transcribe_onnx(model_id, models_path, pcm, language)
+    });
+    if directml_broken {
+        DIRECTML_FAILED.store(true, Ordering::Relaxed);
+        logbuf::warn(format!(
+            "DirectML could not decode {model_id}; using CPU until VocaWin restarts."
+        ));
     }
-    set_ort_accelerator(OrtAccelerator::CpuOnly);
-    transcribe_onnx(model_id, models_path, pcm, language)
+    result
+}
+
+/// Decodes on the GPU first when `gpu` is set, then on CPU if that fails.
+/// Also says whether DirectML is to blame: only when CPU decodes the take
+/// the GPU could not. When CPU fails too, the model or the audio is the
+/// problem, and the CPU error is returned.
+fn decode_with_cpu_fallback(
+    gpu: bool,
+    mut decode: impl FnMut(bool) -> Result<String, String>,
+) -> (Result<String, String>, bool) {
+    if !gpu {
+        return (decode(false), false);
+    }
+    let gpu_error = match decode(true) {
+        Ok(text) => return (Ok(text), false),
+        Err(error) => error,
+    };
+    logbuf::debug(format!("DirectML decode failed; trying CPU: {gpu_error}"));
+    let result = decode(false);
+    let directml_broken = result.is_ok();
+    (result, directml_broken)
 }
 
 fn recognize(state: &AppState, settings: &Settings, pcm: Vec<f32>) -> Result<String, String> {
@@ -4067,6 +4087,53 @@ mod tests {
         assert!(!catalog
             .iter()
             .any(|m| m.id.contains("vosk") || m.id.contains("ctc")));
+    }
+
+    #[test]
+    fn directml_success_needs_no_cpu_pass() {
+        let mut calls = Vec::new();
+        let (result, broken) = decode_with_cpu_fallback(true, |gpu| {
+            calls.push(gpu);
+            Ok("text".into())
+        });
+        assert_eq!(result, Ok("text".into()));
+        assert!(!broken);
+        assert_eq!(calls, vec![true]);
+    }
+
+    #[test]
+    fn directml_is_blamed_only_when_cpu_then_decodes() {
+        let (result, broken) = decode_with_cpu_fallback(true, |gpu| {
+            if gpu {
+                Err("DirectML device lost".into())
+            } else {
+                Ok("text".into())
+            }
+        });
+        assert_eq!(result, Ok("text".into()));
+        assert!(broken);
+
+        // A corrupt model fails on both: not DirectML's fault.
+        let mut calls = Vec::new();
+        let (result, broken) = decode_with_cpu_fallback(true, |gpu| {
+            calls.push(gpu);
+            Err(format!("Could not load Parakeet ({gpu})"))
+        });
+        assert_eq!(result, Err("Could not load Parakeet (false)".into()));
+        assert!(!broken);
+        assert_eq!(calls, vec![true, false]);
+    }
+
+    #[test]
+    fn cpu_only_decodes_once() {
+        let mut calls = Vec::new();
+        let (result, broken) = decode_with_cpu_fallback(false, |gpu| {
+            calls.push(gpu);
+            Err("bad audio".into())
+        });
+        assert_eq!(result, Err("bad audio".into()));
+        assert!(!broken);
+        assert_eq!(calls, vec![false]);
     }
 
     #[test]
