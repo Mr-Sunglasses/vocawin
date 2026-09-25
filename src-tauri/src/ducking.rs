@@ -92,6 +92,7 @@ fn worker(receiver: mpsc::Receiver<Command>) {
 fn mute_playing_sessions(
 ) -> windows::core::Result<Vec<windows::Win32::Media::Audio::ISimpleAudioVolume>> {
     use windows::core::Interface;
+    use windows::Win32::Foundation::S_OK;
     use windows::Win32::Media::Audio::{
         eConsole, eRender, AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2,
         IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
@@ -116,8 +117,10 @@ fn mute_playing_sessions(
             let Ok(control2) = control.cast::<IAudioSessionControl2>() else {
                 continue;
             };
-            // System sounds carry VocaWin's own cues; leave them and ourselves.
-            if control2.IsSystemSoundsSession().0 == 0 {
+            // IsSystemSoundsSession is S_OK for the system-sounds session and
+            // S_FALSE for an app's session. System sounds carry VocaWin's own
+            // cues, so skip them (and ourselves) and mute only other apps.
+            if control2.IsSystemSoundsSession() == S_OK {
                 continue;
             }
             if control2.GetProcessId().ok() == Some(own_process) {

@@ -391,6 +391,20 @@ fn mouse_action(guard: &mut HookShared, button: MouseButton, down: bool) -> Spec
 }
 
 fn emit(event: HookEvent) {
+    // Cancel must not wait behind the actor: it may be busy transcribing the
+    // take Escape is meant to stop, and would only see Cancel after typing.
+    if event == HookEvent::Cancel {
+        let app = shared()
+            .lock()
+            .map(|guard| guard.app.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().app.clone());
+        if let Some(app) = app {
+            let _ = std::thread::Builder::new()
+                .name("vocawin-cancel".into())
+                .spawn(move || crate::on_hotkey_event(&app, HookEvent::Cancel));
+        }
+        return;
+    }
     if let Some(tx) = ACTOR_TX.get() {
         let _ = tx.send(ActorMsg::Event(event));
     }

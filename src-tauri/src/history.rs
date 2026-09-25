@@ -74,10 +74,18 @@ impl HistoryStore {
     }
 
     fn read(&self) -> Vec<HistoryEntry> {
-        fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|contents| serde_json::from_str(&contents).ok())
-            .unwrap_or_default()
+        self.read_checked().unwrap_or_default()
+    }
+
+    /// `Err` when `history.json` exists but cannot be read or parsed. Callers
+    /// that delete audio must not treat that as "no entries".
+    fn read_checked(&self) -> Result<Vec<HistoryEntry>, String> {
+        match fs::read_to_string(&self.path) {
+            Ok(contents) => serde_json::from_str(&contents)
+                .map_err(|error| format!("history.json is unreadable: {error}")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(format!("Could not read history: {error}")),
+        }
     }
 
     fn write(&self, entries: &[HistoryEntry]) -> Result<(), String> {
@@ -92,10 +100,9 @@ impl HistoryStore {
         let temporary = self.path.with_extension("json.tmp");
         fs::write(&temporary, serialized)
             .map_err(|error| format!("Could not save history: {error}"))?;
-        if self.path.exists() {
-            fs::remove_file(&self.path)
-                .map_err(|error| format!("Could not replace history: {error}"))?;
-        }
+        // `fs::rename` replaces the old file in one step on Windows too
+        // (MoveFileEx with REPLACE_EXISTING), so there is never a moment
+        // with no history.json on disk.
         fs::rename(&temporary, &self.path)
             .map_err(|error| format!("Could not save history: {error}"))
     }
@@ -230,7 +237,9 @@ impl HistoryStore {
     /// the list and the audio kept.
     pub fn prune(&self, retention_days: u32) -> Result<(), String> {
         let _guard = self.guard();
-        let mut entries = self.read();
+        // An unreadable index must not look like an empty one: that would
+        // delete every saved recording as an orphan.
+        let mut entries = self.read_checked()?;
         let before = entries.clone();
         if retention_days > 0 {
             let cutoff = now_ms().saturating_sub(retention_days as u128 * 86_400_000);
@@ -431,6 +440,26 @@ mod tests {
         let entry = &store.load()[0];
         assert_eq!(entry.status, STATUS_OK);
         assert!(entry.audio_file.is_none());
+    }
+
+    #[test]
+    fn an_unreadable_index_keeps_its_audio() {
+        let (_directory, store) = store();
+        let id = store.begin(&[0.0; 8_000], "m", true).unwrap();
+        let audio = store.audio_path(id).unwrap();
+        fs::write(&store.path, "{ not json").unwrap();
+        assert!(store.prune(30).is_err());
+        assert!(audio.exists(), "audio must survive a corrupt index");
+    }
+
+    #[test]
+    fn saving_replaces_the_index_in_place() {
+        let (_directory, store) = store();
+        let first = store.begin(&[0.0; 8_000], "m", false).unwrap();
+        let second = store.begin(&[0.0; 8_000], "m", false).unwrap();
+        assert_eq!(store.load().len(), 2);
+        assert!(store.entry(first).is_some() && store.entry(second).is_some());
+        assert!(!store.path.with_extension("json.tmp").exists());
     }
 
     #[test]

@@ -1051,13 +1051,14 @@ fn complete_take(
                 if let Ok(mut last) = state.last_dictation.lock() {
                     *last = take.text.clone();
                 }
-                if let Err(error) = stats::record(&state.stats_path, &take.text, take.speech_ms) {
-                    logbuf::warn(error);
-                }
                 if type_it {
-                    if let Err(error) = inject_transcript(&state, &take.text) {
-                        delivered = Err(format!("Could not type the text: {error}"));
+                    match inject_transcript(&state, &take.text) {
+                        Ok(()) => record_stats(&state, &take.text, take.speech_ms),
+                        Err(error) => delivered = Err(format!("Could not type the text: {error}")),
                     }
+                } else if let Ok(mut pending) = state.pending_window_take.lock() {
+                    // The window types this itself (`inject_text`); count it then.
+                    *pending = Some((take.text.clone(), take.speech_ms));
                 }
             }
             match &delivered {
@@ -1133,6 +1134,9 @@ struct AppState {
     session_generation: AtomicU64,
     /// For paste-last; kept even when history is off.
     last_dictation: Mutex<String>,
+    /// A take the VocaWin window will type itself: counted in stats when
+    /// `inject_text` succeeds with this text.
+    pending_window_take: Mutex<Option<(String, u64)>>,
     ducker: ducking::Ducker,
 }
 
@@ -1157,11 +1161,9 @@ fn persist_settings(path: &std::path::Path, settings: &Settings) -> Result<(), S
     let temporary = path.with_extension("json.tmp");
     fs::write(&temporary, serialized)
         .map_err(|error| format!("Could not write settings: {error}"))?;
-    // Windows does not replace an existing file during rename, so remove the
-    // previous version only after the complete temporary file was written.
-    if path.exists() {
-        fs::remove_file(path).map_err(|error| format!("Could not replace settings: {error}"))?;
-    }
+    // `fs::rename` replaces the existing file in one step on Windows
+    // (MoveFileEx with REPLACE_EXISTING), so a crash never leaves no
+    // settings.json behind.
     fs::rename(temporary, path).map_err(|error| format!("Could not finalize settings: {error}"))
 }
 
@@ -3055,7 +3057,23 @@ fn inject_text(text: String, state: State<'_, AppState>) -> Result<(), String> {
     if text.trim().is_empty() {
         return Ok(());
     }
-    inject_transcript(&*state, &text)
+    inject_transcript(&*state, &text)?;
+    let pending = state
+        .pending_window_take
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take());
+    if let Some((dictated, speech_ms)) = pending.filter(|(dictated, _)| *dictated == text) {
+        record_stats(&state, &dictated, speech_ms);
+    }
+    Ok(())
+}
+
+/// Stats count a dictation only once its text reached the app.
+fn record_stats(state: &AppState, text: &str, speech_ms: u64) {
+    if let Err(error) = stats::record(&state.stats_path, text, speech_ms) {
+        logbuf::warn(error);
+    }
 }
 
 /// What the overlay page should show when it (re)loads.
@@ -3190,6 +3208,7 @@ pub fn run() {
                 cancel_generation: AtomicU64::new(0),
                 session_generation: AtomicU64::new(0),
                 last_dictation: Mutex::new(String::new()),
+                pending_window_take: Mutex::new(None),
                 ducker: ducking::Ducker::new(),
             });
             if let Err(error) = apply_launch_at_login(&handle, settings.launch_at_login) {
