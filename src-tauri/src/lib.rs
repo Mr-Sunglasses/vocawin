@@ -986,8 +986,12 @@ fn apply_ready_or_parked_tray(app: &AppHandle) {
 fn finish_captured_audio(app: &AppHandle, samples: Vec<f32>, sample_rate: u32, session: u64) {
     let state = app.state::<AppState>();
     state.processing.store(true, Ordering::SeqCst);
-    set_recording_flag(&state, false);
-    let _ = app.emit("recording-changed", false);
+    // A newer take may already be recording; its flag and indicator are not
+    // this take's to clear.
+    if state.session_id.load(Ordering::SeqCst) == session {
+        set_recording_flag(&state, false);
+        let _ = app.emit("recording-changed", false);
+    }
     let sound = state
         .settings
         .lock()
@@ -1043,10 +1047,12 @@ fn complete_take(
         overlay::show(app, overlay::Phase::Processing, overlay_on(&settings));
     }
     let result = transcribe_samples(&state, samples, sample_rate);
+    // Decide on cancellation while still marked as transcribing, so an
+    // Escape that lands now is either seen here or finds nothing to stop.
+    let cancelled = cancellations(&state).settle(session);
     state.processing.store(false, Ordering::SeqCst);
     let recording_again = *state.recording.lock().unwrap_or_else(|e| e.into_inner());
     hook::disarm_cancel_for(session);
-    let cancelled = take_cancellation(&state, session);
     let outcome = match result {
         Ok(take) if cancelled => {
             if let Some(id) = take.history_id {
@@ -1142,9 +1148,10 @@ struct AppState {
     processing: AtomicBool,
     /// Id of the newest take, bumped when one starts.
     session_id: AtomicU64,
-    /// Ids of takes Escape cancelled that have not finished yet; they are
-    /// not typed. Several can be in flight at once.
-    cancelled_sessions: Mutex<Vec<u64>>,
+    /// Which takes Escape cancelled and which already committed to typing.
+    /// One lock decides between the two, so Escape either stops a take or
+    /// finds it too late, never both.
+    cancellations: Mutex<Cancellations>,
     /// For paste-last; kept even when history is off.
     last_dictation: Mutex<String>,
     /// A take the VocaWin window will type itself: counted in stats when
@@ -2710,7 +2717,10 @@ fn cancel_voice_session(app: &AppHandle, session: u64) {
         logbuf::debug("Escape for an earlier take ignored.");
         return;
     }
-    mark_cancelled(&state, session);
+    if !cancellations(&state).cancel(session) {
+        logbuf::debug("Escape came after the take was typed.");
+        return;
+    }
     hook::disarm_cancel_for(session);
     let settings = state.settings.lock().map(|s| s.clone()).unwrap_or_default();
     let recording = *state.recording.lock().unwrap_or_else(|e| e.into_inner())
@@ -2721,48 +2731,59 @@ fn cancel_voice_session(app: &AppHandle, session: u64) {
         let _ = app.emit("recording-changed", false);
         logbuf::info_and_emit(app, "Dictation cancelled.");
         apply_ready_or_parked_tray(app);
-    } else if state.processing.load(Ordering::SeqCst) {
-        logbuf::info_and_emit(app, "Transcription cancelled; nothing will be typed.");
     } else {
-        // Already typed: nothing left to stop.
-        take_cancellation(&state, session);
-        return;
+        // Not settled yet (checked above), so completion will see the mark.
+        logbuf::info_and_emit(app, "Transcription cancelled; nothing will be typed.");
     }
     overlay::show(app, overlay::Phase::Cancelled, overlay_on(&settings));
     let _ = app.emit("dictation-cancelled", ());
 }
 
-/// Remember that take `session` was cancelled. Bounded: a take cancelled
-/// while recording never reaches `take_cancellation`.
-fn mark_cancelled(state: &AppState, session: u64) {
-    let mut cancelled = state
-        .cancelled_sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    remember_cancelled(&mut cancelled, session);
+/// Cancelled takes and takes that are past the point of cancelling. Both
+/// lists are bounded; ids are never reused.
+#[derive(Default)]
+struct Cancellations {
+    cancelled: Vec<u64>,
+    settled: Vec<u64>,
 }
 
-fn remember_cancelled(cancelled: &mut Vec<u64>, session: u64) {
-    if !cancelled.contains(&session) {
-        cancelled.push(session);
-    }
-    let excess = cancelled.len().saturating_sub(16);
-    cancelled.drain(..excess);
-}
-
-/// Whether take `session` was cancelled, forgetting it either way.
-fn take_cancellation(state: &AppState, session: u64) -> bool {
-    let mut cancelled = state
-        .cancelled_sessions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match cancelled.iter().position(|id| *id == session) {
-        Some(index) => {
-            cancelled.remove(index);
-            true
+impl Cancellations {
+    /// Escape for `session`. False when the take already committed to typing.
+    fn cancel(&mut self, session: u64) -> bool {
+        if self.settled.contains(&session) {
+            return false;
         }
-        None => false,
+        remember(&mut self.cancelled, session);
+        true
     }
+
+    /// The take is about to type (or not): was it cancelled? From here on
+    /// a later Escape is refused.
+    fn settle(&mut self, session: u64) -> bool {
+        remember(&mut self.settled, session);
+        match self.cancelled.iter().position(|id| *id == session) {
+            Some(index) => {
+                self.cancelled.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+fn remember(ids: &mut Vec<u64>, session: u64) {
+    if !ids.contains(&session) {
+        ids.push(session);
+    }
+    let excess = ids.len().saturating_sub(16);
+    ids.drain(..excess);
+}
+
+fn cancellations(state: &AppState) -> std::sync::MutexGuard<'_, Cancellations> {
+    state
+        .cancellations
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 fn is_current_session(current: u64, cancelled: u64) -> bool {
@@ -3268,7 +3289,7 @@ pub fn run() {
                 session_trigger: Mutex::new(Trigger::default()),
                 processing: AtomicBool::new(false),
                 session_id: AtomicU64::new(0),
-                cancelled_sessions: Mutex::new(Vec::new()),
+                cancellations: Mutex::new(Cancellations::default()),
                 last_dictation: Mutex::new(String::new()),
                 pending_window_take: Mutex::new(None),
                 ducker: ducking::Ducker::new(),
@@ -4533,16 +4554,28 @@ mod tests {
 
     #[test]
     fn cancellations_of_overlapping_takes_are_all_kept() {
-        let mut cancelled = Vec::new();
-        remember_cancelled(&mut cancelled, 4);
-        remember_cancelled(&mut cancelled, 5);
-        remember_cancelled(&mut cancelled, 5);
-        assert_eq!(cancelled, vec![4, 5]);
-        for session in 6..40 {
-            remember_cancelled(&mut cancelled, session);
+        let mut cancellations = Cancellations::default();
+        assert!(cancellations.cancel(4));
+        assert!(cancellations.cancel(5));
+        assert!(cancellations.cancel(5));
+        assert!(cancellations.settle(4));
+        assert!(cancellations.settle(5));
+        assert!(!cancellations.settle(6));
+        for session in 7..40 {
+            cancellations.cancel(session);
         }
-        assert_eq!(cancelled.len(), 16);
-        assert_eq!(cancelled.last(), Some(&39));
+        assert_eq!(cancellations.cancelled.len(), 16);
+    }
+
+    #[test]
+    fn escape_after_a_take_commits_is_refused_not_half_applied() {
+        let mut cancellations = Cancellations::default();
+        // Completion decided first: the text types, and Escape says so.
+        assert!(!cancellations.settle(8));
+        assert!(!cancellations.cancel(8));
+        // Escape first: completion sees it and does not type.
+        assert!(cancellations.cancel(9));
+        assert!(cancellations.settle(9));
     }
 
     #[test]
