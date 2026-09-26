@@ -1087,6 +1087,10 @@ fn complete_take(
             }
             delivered
         }
+        Err(error) if cancelled && error == NO_SPEECH => {
+            logbuf::info_and_emit(app, "Cancelled take was not typed.");
+            Ok(String::new())
+        }
         Err(error) => {
             if inject {
                 overlay::show(app, overlay::Phase::Error(error.clone()), overlay_on(&settings));
@@ -2523,6 +2527,9 @@ fn text_language(settings: &Settings) -> Option<&'static str> {
     })
 }
 
+/// Shown when a take decodes to no words (silence, or only noise markers).
+const NO_SPEECH: &str = "No speech was recognized. Nothing was typed.";
+
 /// A finished take: the text to type, its history entry, and how long the
 /// speech was.
 struct Take {
@@ -2566,7 +2573,15 @@ fn transcribe_samples(state: &AppState, samples: Vec<f32>, sample_rate: u32) -> 
     } else {
         None
     };
-    let result = recognize_and_format(state, &settings, &pcm);
+    // A take with no words is an error, not a silent no-op, so the overlay,
+    // the error sound and History all say nothing was typed.
+    let result = recognize_and_format(state, &settings, &pcm).and_then(|text| {
+        if text.trim().is_empty() {
+            Err(NO_SPEECH.into())
+        } else {
+            Ok(text)
+        }
+    });
     if let Some(id) = history_id {
         let saved = match &result {
             Ok(text) => state.history.finish(
