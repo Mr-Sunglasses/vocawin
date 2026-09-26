@@ -279,4 +279,16 @@ mod tests {
             "So I think we should ship it on Friday"
         );
     }
+
+    #[test]
+    fn detected_portuguese_keeps_um_and_french_loses_euh() {
+        let opts = options();
+        // "um" is Portuguese for "a"; English cleanup would delete it.
+        let portuguese = "Eu comprei um carro novo para a minha família ontem, ok";
+        assert!(process(portuguese, &opts).contains(" um carro"));
+        // Detected French gets its own filler words.
+        let french = process("Je voudrais euh réserver une table pour quatre personnes ce soir", &opts);
+        assert!(!french.contains("euh"), "{french}");
+        assert!(french.contains("réserver une table"), "{french}");
+    }
 }
