@@ -16,6 +16,8 @@ A small pill shows at the bottom of the screen for a few seconds after VocaWin s
 
 Text is typed at the caret, a few characters at a time, and your clipboard is left alone. If an app drops or garbles typed text, add it under Formatting, Always paste in these apps (or switch How text goes in to Paste): VocaWin pastes there and puts your clipboard back afterwards. Apps running as administrator block input from VocaWin; the text is left on the clipboard instead, so press Ctrl+V.
 
+After a take the microphone stays open, unrecorded, for 30 seconds, so the next take starts at once; Windows shows its microphone indicator until it closes. Nothing is stored or sent while it is open between takes.
+
 The tray mic is teal when idle, red while you speak, amber while a take is processing, and slate when the model is unloaded or paused.
 
 The window title and the sidebar pill say Beta. That means this is a tester build, not a store ship.
