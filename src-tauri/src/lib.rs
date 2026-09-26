@@ -3,6 +3,7 @@
 
 mod autopause;
 mod autostart;
+mod chunking;
 mod cleanup;
 mod devices;
 mod dictionary;
@@ -2115,13 +2116,14 @@ fn transcribe_onnx(
             model_path.display()
         ));
     }
-    let result = match model_id {
+    let text = match model_id {
         "parakeet-tdt-0.6b-v3" => {
             let mut model = ParakeetModel::load(&model_path, &Quantization::Int8)
                 .map_err(|error| format!("Could not load Parakeet: {error}"))?;
             model
                 .transcribe_with(pcm, &ParakeetParams::default())
                 .map_err(|error| format!("Parakeet transcription failed: {error}"))?
+                .text
         }
         "moonshine-tiny" | "moonshine-base" => {
             let variant = if model_id == "moonshine-tiny" {
@@ -2131,15 +2133,12 @@ fn transcribe_onnx(
             };
             let mut model = MoonshineModel::load(&model_path, variant, &Quantization::default())
                 .map_err(|error| format!("Could not load Moonshine: {error}"))?;
-            // Moonshine's public adapter takes a WAV path. The PCM is already
-            // mono/16 kHz, so writing this short temporary file is lossless.
-            let wav_path = models_path.join(".vocawin-recording.wav");
-            write_pcm_wav(&wav_path, pcm)?;
-            let output = model
-                .transcribe_file(&wav_path, &transcribe_rs::TranscribeOptions::default())
-                .map_err(|error| format!("Moonshine transcription failed: {error}"));
-            let _ = fs::remove_file(wav_path);
-            output?
+            decode_in_windows(pcm, |window| {
+                model
+                    .transcribe(window, &transcribe_rs::TranscribeOptions::default())
+                    .map(|result| result.text)
+                    .map_err(|error| format!("Moonshine transcription failed: {error}"))
+            })?
         }
         "sensevoice-small" => {
             let mut model = SenseVoiceModel::load(&model_path, &Quantization::Int8)
@@ -2153,47 +2152,68 @@ fn transcribe_onnx(
                     },
                 )
                 .map_err(|error| format!("SenseVoice transcription failed: {error}"))?
+                .text
         }
         "gigaam-v3" => {
             let mut model = GigaAMModel::load(&model_path, &Quantization::Int8)
                 .map_err(|error| format!("Could not load GigaAM: {error}"))?;
-            let wav_path = models_path.join(".vocawin-recording.wav");
-            write_pcm_wav(&wav_path, pcm)?;
-            let output = model
-                .transcribe_file(&wav_path, &transcribe_rs::TranscribeOptions::default())
-                .map_err(|error| format!("GigaAM transcription failed: {error}"));
-            let _ = fs::remove_file(wav_path);
-            output?
+            decode_in_windows(pcm, |window| {
+                model
+                    .transcribe(window, &transcribe_rs::TranscribeOptions::default())
+                    .map(|result| result.text)
+                    .map_err(|error| format!("GigaAM transcription failed: {error}"))
+            })?
         }
         "canary-180m" => {
             let mut model = CanaryModel::load(&model_path, &Quantization::Int8)
                 .map_err(|error| format!("Could not load Canary: {error}"))?;
-            model
-                .transcribe_with(pcm, &CanaryParams::default())
-                .map_err(|error| format!("Canary transcription failed: {error}"))?
+            decode_in_windows(pcm, |window| {
+                model
+                    .transcribe_with(window, &CanaryParams::default())
+                    .map(|result| result.text)
+                    .map_err(|error| format!("Canary transcription failed: {error}"))
+            })?
         }
         _ => return Err(format!("The {} adapter is not available yet.", model_id)),
     };
-    Ok(result.text.trim().to_string())
+    Ok(text.trim().to_string())
 }
 
-fn write_pcm_wav(path: &std::path::Path, pcm: &[f32]) -> Result<(), String> {
-    let specification = hound::WavSpec {
-        channels: 1,
-        sample_rate: 16_000,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(path, specification)
-        .map_err(|error| format!("Could not prepare audio for transcription: {error}"))?;
-    for sample in pcm {
-        writer
-            .write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-            .map_err(|error| format!("Could not write audio for transcription: {error}"))?;
+/// Decodes a take in `chunking` windows and joins the text. Canary and
+/// Moonshine drop or repeat text on long takes, Moonshine rejects takes over
+/// 64 s, and GigaAM's encoder rejects takes over 200 s.
+///
+/// Moonshine also returns nothing for a window that opens on a second or
+/// more of pause (a pause too long for a cut to reach past, or any take with
+/// Skip Silence off). A window that decodes to nothing is decoded once more
+/// with its long pauses shortened and every sound kept; it had no text to
+/// lose.
+fn decode_in_windows(
+    pcm: &[f32],
+    mut decode: impl FnMut(&[f32]) -> Result<String, String>,
+) -> Result<String, String> {
+    let ranges = chunking::windows(pcm);
+    if ranges.len() > 1 {
+        logbuf::debug(format!("Decoding the take in {} windows.", ranges.len()));
     }
-    writer
-        .finalize()
-        .map_err(|error| format!("Could not finalize audio for transcription: {error}"))
+    let mut parts = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let window = &pcm[range];
+        let mut text = decode(window)?;
+        if text.trim().is_empty() {
+            if let Some(shortened) = chunking::without_long_pauses(window) {
+                logbuf::debug(
+                    "A window decoded to nothing; decoding it again with its pauses shortened.",
+                );
+                text = decode(&shortened)?;
+            }
+        }
+        let text = text.trim();
+        if !text.is_empty() {
+            parts.push(text.to_owned());
+        }
+    }
+    Ok(parts.join(" "))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3876,6 +3896,108 @@ fn tray_toggle_login(app: &AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 50 s of tone with a 0.4 s gap near each 16.7 s split, so it decodes
+    /// as three windows.
+    fn three_window_take() -> Vec<f32> {
+        let tone = |seconds: f32| -> Vec<f32> {
+            (0..(seconds * 16_000.0) as usize)
+                .map(|i| (i as f32 * 0.07).sin() * 0.3)
+                .collect()
+        };
+        let mut pcm = tone(16.5);
+        pcm.extend(vec![0.0; 6_400]);
+        pcm.extend(tone(16.5));
+        pcm.extend(vec![0.0; 6_400]);
+        pcm.extend(tone(16.2));
+        pcm
+    }
+
+    #[test]
+    fn short_takes_are_decoded_in_one_call() {
+        let pcm = vec![0.1; 16_000 * 5];
+        let mut calls = Vec::new();
+        let text = decode_in_windows(&pcm, |window| {
+            calls.push(window.len());
+            Ok(" hello ".into())
+        })
+        .unwrap();
+        assert_eq!(calls, vec![pcm.len()]);
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn window_texts_join_in_order_without_empty_ones() {
+        let pcm = three_window_take();
+        let mut index = 0;
+        let text = decode_in_windows(&pcm, |_| {
+            index += 1;
+            Ok(match index {
+                1 => " first part ".into(),
+                2 => "   ".into(),
+                _ => "third part".into(),
+            })
+        })
+        .unwrap();
+        assert_eq!(index, 3);
+        assert_eq!(text, "first part third part");
+    }
+
+    #[test]
+    fn an_empty_window_is_decoded_again_with_its_pauses_shortened() {
+        // 0.8 s of pause, a click, 1 s more pause, then speech. The stub,
+        // like Moonshine, returns nothing for audio that opens on half a
+        // second or more of pause.
+        let opens_on_pause =
+            |window: &[f32]| window.iter().position(|s| s.abs() >= 0.1) >= Some(8_000);
+        let mut pcm = vec![0.0; 8_000 + 4_800];
+        pcm.extend(vec![1.0; 480]);
+        pcm.extend(vec![0.0; 16_000]);
+        pcm.extend((0..16_000 * 3).map(|i| (i as f32 * 0.07).sin() * 0.3));
+        let mut decoded = Vec::new();
+        let text = decode_in_windows(&pcm, |window| {
+            decoded.push(window.to_vec());
+            Ok(if opens_on_pause(window) {
+                String::new()
+            } else {
+                "speech".into()
+            })
+        })
+        .unwrap();
+        assert_eq!(text, "speech");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0], pcm);
+        // The retry keeps the click and all of the speech.
+        let loud = |audio: &[f32]| audio.iter().filter(|s| s.abs() >= 0.1).count();
+        assert_eq!(loud(&decoded[1]), loud(&pcm));
+        assert!(decoded[1].len() < pcm.len());
+
+        // Text on the first pass: no second one.
+        let mut calls = 0;
+        decode_in_windows(&pcm, |_| {
+            calls += 1;
+            Ok("speech".into())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_failed_window_fails_the_take() {
+        let pcm = three_window_take();
+        let mut calls = 0;
+        let result = decode_in_windows(&pcm, |_| {
+            calls += 1;
+            if calls == 2 {
+                Err("Canary transcription failed: boom".into())
+            } else {
+                Ok("text".into())
+            }
+        });
+        assert_eq!(result, Err("Canary transcription failed: boom".into()));
+        assert_eq!(calls, 2);
+    }
+
     #[test]
     fn catalog_has_unique_ids_and_voca_engines() {
         let catalog = model_catalog();
