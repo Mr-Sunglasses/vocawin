@@ -108,8 +108,9 @@ fn cut_point(samples: &[f32], lower: usize, upper: usize) -> usize {
 /// a second or more of pause, and this audio never does.
 ///
 /// A pause is measured from the window's opening, so a noisy room counts
-/// as one while sound is clearly louder. `None` when nothing would be
-/// shortened (no long pause, or no sound at all).
+/// as one while sound is clearly louder. After the first clearly-loud
+/// frame, quieter speech between louder passages is kept. `None` when
+/// nothing would be shortened (no long pause, or no sound at all).
 pub fn without_long_pauses(samples: &[f32]) -> Option<Vec<f32>> {
     let rms: Vec<f32> = samples
         .chunks(FRAME)
@@ -121,11 +122,18 @@ pub fn without_long_pauses(samples: &[f32]) -> Option<Vec<f32>> {
     }
     let mut opening = rms[..opening_frames].to_vec();
     opening.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let threshold = (opening[opening.len() / 2] * SOUND_OVER_OPENING).max(MINIMUM_SOUND_RMS);
+    let opening_rms = opening[opening.len() / 2];
+    let high = (opening_rms * SOUND_OVER_OPENING).max(MINIMUM_SOUND_RMS);
+    let first_high = rms.iter().position(|value| *value >= high)?;
     let padding = seconds(LEAD_SECONDS);
     let mut sounds: Vec<Range<usize>> = Vec::new();
     for (index, value) in rms.iter().enumerate() {
-        if *value < threshold {
+        let keep = if index < first_high {
+            *value >= high
+        } else {
+            *value > opening_rms
+        };
+        if !keep {
             continue;
         }
         let start = (index * FRAME).saturating_sub(padding);
@@ -343,5 +351,35 @@ mod tests {
         assert_eq!(without_long_pauses(&breath), None);
         assert_eq!(without_long_pauses(&noise(3.0, 0.004)), None);
         assert_eq!(without_long_pauses(&[]), None);
+    }
+
+    #[test]
+    fn quieter_speech_between_louder_passages_survives_a_retry() {
+        // Opening room noise 0.02 RMS makes the old single threshold 0.06, which
+        // dropped quieter speech between louder passages on retry.
+        let mut samples = noise(1.2, 0.02);
+        samples.extend(tone(0.8)); // loud ~0.3
+
+        // Quieter sine: peak 0.04, frame RMS ~0.028 (above opening, below 0.06).
+        // 1.2 s so 0.2 s padding and a 0.4 s shortened pause cannot reconstruct it.
+        samples.extend(
+            (0..seconds(1.2))
+                .map(|i| (i as f32 * 0.07).sin() * 0.04)
+                .collect::<Vec<_>>(),
+        );
+        samples.extend(tone(0.8));
+        samples.extend(noise(1.0, 0.02));
+
+        let shortened = without_long_pauses(&samples).expect("opening pause to shorten");
+        let quietish = |audio: &[f32]| -> Vec<f32> {
+            audio.iter().copied().filter(|s| s.abs() >= 0.035).collect()
+        };
+        assert_eq!(quietish(&shortened), quietish(&samples));
+        assert!(shortened.len() < samples.len());
+        let opening = shortened.iter().position(|s| s.abs() >= 0.035).unwrap();
+        assert!(
+            opening <= seconds(LEAD_SECONDS) + FRAME,
+            "opens on {opening} samples"
+        );
     }
 }
