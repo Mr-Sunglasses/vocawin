@@ -22,7 +22,6 @@ tauri-plugin-single-instance = "2"
 cpal = "0.15"
 rubato = "0.16"
 whatlang = "0.16"
-# Same ONNX Runtime as transcribe-rs; runs the bundled Silero VAD.
 # Same ONNX Runtime as transcribe-rs; runs the downloaded Silero VAD.
 ort = "=2.0.0-rc.12"
 sha2 = "0.10"
