@@ -14,6 +14,7 @@ mod hinglish;
 mod history;
 mod hook;
 mod hotkey;
+mod lang_id;
 mod logbuf;
 mod machine;
 mod output;

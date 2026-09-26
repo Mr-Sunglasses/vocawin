@@ -21,6 +21,7 @@ tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
 cpal = "0.15"
 rubato = "0.16"
+whatlang = "0.16"
 transcribe-rs = { version = "0.3.8", features = ["onnx"] }
 hound = "3.5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
