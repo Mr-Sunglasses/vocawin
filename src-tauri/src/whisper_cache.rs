@@ -217,8 +217,9 @@ fn run_transcribe(
         .filter_map(|index| {
             session
                 .get_segment(index)
-                .and_then(|segment| segment.to_str().ok().map(str::to_owned))
+                .and_then(|segment| segment.to_str().ok().map(spoken_text))
         })
+        .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
     if !keep_alive {
@@ -226,4 +227,78 @@ fn run_transcribe(
         *loaded_path = None;
     }
     Ok(text)
+}
+
+/// A segment's text without whisper.cpp's non-speech markers. On silence or
+/// noise Whisper writes tags such as `[BLANK_AUDIO]`, `[ Silence ]`,
+/// `(music)` or `*sigh*` as ordinary text, and typing them is never right.
+/// Square brackets are always markers; parentheses and asterisks count only
+/// when they are all the segment holds, since spoken asides can use them.
+fn spoken_text(segment: &str) -> String {
+    let mut kept = String::with_capacity(segment.len());
+    let mut rest = segment;
+    while let Some(open) = rest.find('[') {
+        let Some(close) = rest[open..].find(']') else {
+            break;
+        };
+        kept.push_str(&rest[..open]);
+        rest = &rest[open + close + 1..];
+    }
+    kept.push_str(rest);
+    let text = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    if only_markers(&text) {
+        String::new()
+    } else {
+        text
+    }
+}
+
+/// True when nothing but `(...)` / `*...*` asides, music notes and
+/// punctuation is left.
+fn only_markers(text: &str) -> bool {
+    let mut inside: Option<char> = None;
+    for ch in text.chars() {
+        match inside {
+            Some(close) if ch == close => inside = None,
+            Some(_) => {}
+            None => match ch {
+                '(' => inside = Some(')'),
+                '*' => inside = Some('*'),
+                _ if ch.is_alphanumeric() => return false,
+                _ => {}
+            },
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spoken_text;
+
+    #[test]
+    fn non_speech_markers_are_dropped() {
+        for marker in [
+            "[BLANK_AUDIO]",
+            " [BLANK_AUDIO]",
+            "[ Silence ]",
+            "[MUSIC PLAYING]",
+            "(silence)",
+            "(upbeat music)",
+            "*sigh*",
+            "\u{266a}",
+            "[BLANK_AUDIO] (wind blowing)",
+        ] {
+            assert_eq!(spoken_text(marker), "", "{marker:?}");
+        }
+    }
+
+    #[test]
+    fn speech_around_markers_is_kept() {
+        assert_eq!(spoken_text(" Hello there."), "Hello there.");
+        assert_eq!(spoken_text("[BLANK_AUDIO] Hello [MUSIC] world"), "Hello world");
+        assert_eq!(spoken_text("Call me (maybe) later"), "Call me (maybe) later");
+        assert_eq!(spoken_text("Five * three"), "Five * three");
+        assert_eq!(spoken_text("an open [bracket"), "an open [bracket");
+    }
 }
