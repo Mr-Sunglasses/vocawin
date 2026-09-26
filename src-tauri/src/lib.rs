@@ -2615,10 +2615,12 @@ fn transcribe_onnx(
     accelerator: transcribe_rs::accel::OrtAccelerator,
 ) -> Result<String, String> {
     let key = onnx_key(model_id, accelerator);
-    let mut model = ONNX_MODELS.take(&key, || load_onnx_model(model_id, models_path, accelerator))?;
-    let text = decode_onnx(&mut model, model_id, pcm, language);
+    let mut lease = ONNX_MODELS.take(&key, || load_onnx_model(model_id, models_path, accelerator))?;
+    let text = decode_onnx(&mut lease.model, model_id, pcm, language);
     if text.is_ok() {
-        ONNX_MODELS.put(&key, model);
+        ONNX_MODELS.put(lease);
+    } else {
+        ONNX_MODELS.release(lease);
     }
     text
 }
