@@ -199,6 +199,8 @@ impl HistoryStore {
         self.write(&entries)
     }
 
+    /// Changes the status and drops the error the old status carried: a
+    /// cancelled take is no longer a failure.
     pub fn set_status(&self, id: u128, status: &str) -> Result<(), String> {
         let _guard = self.guard();
         let mut entries = self.read();
@@ -206,6 +208,7 @@ impl HistoryStore {
             return Ok(());
         };
         entry.status = status.to_string();
+        entry.error = None;
         self.write(&entries)
     }
 
@@ -395,6 +398,19 @@ mod tests {
             .unwrap();
         assert!(store.entry(id).is_none());
         assert!(!audio.exists());
+    }
+
+    #[test]
+    fn a_cancelled_failure_loses_its_error() {
+        let (_directory, store) = store();
+        let id = store.begin(&[0.0; 8_000], "whisper-tiny", true).unwrap();
+        store
+            .finish(id, "", "whisper-tiny", STATUS_FAILED, Some("No speech".into()))
+            .unwrap();
+        store.set_status(id, STATUS_CANCELLED).unwrap();
+        let entry = store.entry(id).unwrap();
+        assert_eq!(entry.status, STATUS_CANCELLED);
+        assert_eq!(entry.error, None);
     }
 
     #[test]
