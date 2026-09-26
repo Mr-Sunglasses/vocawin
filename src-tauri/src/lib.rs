@@ -4693,19 +4693,41 @@ mod tests {
         assert!(rms(&folded[1_000..15_000]) > 0.1);
     }
 
-    #[test]
-    fn resampling_keeps_timing() {
-        // A click at 0.5 s lands at 0.5 s: the filter delay is removed.
-        let mut input = vec![0.0; 48_000];
-        input[24_000] = 1.0;
-        let output = resample_to_16khz(&input, 48_000);
+    fn click_position(len: usize, click: usize, rate: u32) -> (usize, usize) {
+        let mut input = vec![0.0; len];
+        input[click] = 1.0;
+        let output = resample_to_16khz(&input, rate);
         let peak = output
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
             .unwrap()
             .0;
+        (peak, output.len())
+    }
+
+    #[test]
+    fn resampling_keeps_timing() {
+        // A click at 0.5 s lands at 0.5 s: the filter delay is removed.
+        let (peak, _) = click_position(48_000, 24_000, 48_000);
         assert!((7_998..=8_002).contains(&peak), "{peak}");
+    }
+
+    #[test]
+    fn resampling_keeps_the_end_of_the_take() {
+        // The last partial chunk and the flushed filter tail: a click 30 ms
+        // before the end is still there, on time, at 48 and 44.1 kHz.
+        let (peak, len) = click_position(48_000, 46_560, 48_000);
+        assert_eq!(len, 16_000);
+        assert!((15_518..=15_522).contains(&peak), "{peak}");
+        let (peak, len) = click_position(44_100, 42_777, 44_100);
+        assert_eq!(len, 16_000);
+        assert!((15_518..=15_522).contains(&peak), "{peak}");
+        // An input that is a whole number of 1024-sample chunks has no
+        // partial chunk; its end must survive the flush too.
+        let (peak, len) = click_position(1024 * 48, 1024 * 48 - 1_440, 48_000);
+        assert_eq!(len, 1024 * 48 / 3);
+        assert!((len - 482..=len - 478).contains(&peak), "{peak} of {len}");
     }
 
     #[test]
