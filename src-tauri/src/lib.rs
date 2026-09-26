@@ -470,6 +470,8 @@ enum AudioCommand {
     IsLive {
         reply: mpsc::Sender<bool>,
     },
+    /// Close a microphone kept open after a take (auto-pause).
+    ReleaseMicrophone,
 }
 
 const AUDIO_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
@@ -495,11 +497,9 @@ struct AudioRecorder {
 #[cfg(windows)]
 fn note_audio_sample(
     mono: f32,
-    samples: &Arc<Mutex<Vec<f32>>>,
     last_voice_ms: &Arc<Mutex<u128>>,
     heard_speech: &Arc<Mutex<bool>>,
     peak_level: &Arc<Mutex<f32>>,
-    store_samples: bool,
 ) {
     const VOICE_THRESHOLD: f32 = 0.015;
     let level = mono.abs();
@@ -514,8 +514,17 @@ fn note_audio_sample(
             *last = now_ms();
         }
     }
-    if store_samples {
-        samples.lock().unwrap().push(mono);
+}
+
+/// Appends a callback's samples to the take. The store flag is read under
+/// the buffer lock, and `take_recording` clears it under the same lock, so
+/// no frame lands in a buffer that was already handed off.
+#[cfg(windows)]
+fn store_frames(samples: &Arc<Mutex<Vec<f32>>>, store: &AtomicBool, frames: &[f32]) {
+    if let Ok(mut buffer) = samples.lock() {
+        if store.load(Ordering::Relaxed) {
+            buffer.extend_from_slice(frames);
+        }
     }
 }
 
@@ -528,7 +537,7 @@ fn open_input_stream(
     store: Arc<AtomicBool>,
     last_audio_ms: Arc<std::sync::atomic::AtomicU64>,
     device_name: &str,
-) -> Result<(cpal::Stream, u32), String> {
+) -> Result<(cpal::Stream, u32, String), String> {
     let host = cpal::default_host();
     let device = if device_name.trim().is_empty() {
         host.default_input_device()
@@ -569,18 +578,13 @@ fn open_input_stream(
                 &config,
                 move |data: &[f32], _| {
                     last_audio_ms.store(now_ms() as u64, Ordering::Relaxed);
-                    let store_samples = store.load(Ordering::Relaxed);
+                    let mut frames = Vec::with_capacity(data.len() / channels.max(1));
                     for frame in data.chunks(channels) {
                         let mono = frame.iter().sum::<f32>() / frame.len() as f32;
-                        note_audio_sample(
-                            mono,
-                            &samples,
-                            &last_voice_ms,
-                            &heard_speech,
-                            &peak_level,
-                            store_samples,
-                        );
+                        note_audio_sample(mono, &last_voice_ms, &heard_speech, &peak_level);
+                        frames.push(mono);
                     }
+                    store_frames(&samples, &store, &frames);
                 },
                 error_callback,
                 None,
@@ -597,22 +601,17 @@ fn open_input_stream(
                 &config,
                 move |data: &[i16], _| {
                     last_audio_ms.store(now_ms() as u64, Ordering::Relaxed);
-                    let store_samples = store.load(Ordering::Relaxed);
+                    let mut frames = Vec::with_capacity(data.len() / channels.max(1));
                     for frame in data.chunks(channels) {
                         let mono = frame
                             .iter()
                             .map(|sample| *sample as f32 / i16::MAX as f32)
                             .sum::<f32>()
                             / frame.len() as f32;
-                        note_audio_sample(
-                            mono,
-                            &samples,
-                            &last_voice_ms,
-                            &heard_speech,
-                            &peak_level,
-                            store_samples,
-                        );
+                        note_audio_sample(mono, &last_voice_ms, &heard_speech, &peak_level);
+                        frames.push(mono);
                     }
+                    store_frames(&samples, &store, &frames);
                 },
                 error_callback,
                 None,
@@ -629,22 +628,17 @@ fn open_input_stream(
                 &config,
                 move |data: &[u16], _| {
                     last_audio_ms.store(now_ms() as u64, Ordering::Relaxed);
-                    let store_samples = store.load(Ordering::Relaxed);
+                    let mut frames = Vec::with_capacity(data.len() / channels.max(1));
                     for frame in data.chunks(channels) {
                         let mono = frame
                             .iter()
                             .map(|sample| (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
                             .sum::<f32>()
                             / frame.len() as f32;
-                        note_audio_sample(
-                            mono,
-                            &samples,
-                            &last_voice_ms,
-                            &heard_speech,
-                            &peak_level,
-                            store_samples,
-                        );
+                        note_audio_sample(mono, &last_voice_ms, &heard_speech, &peak_level);
+                        frames.push(mono);
                     }
+                    store_frames(&samples, &store, &frames);
                 },
                 error_callback,
                 None,
@@ -656,7 +650,17 @@ fn open_input_stream(
     stream
         .play()
         .map_err(|error| format!("Could not start microphone: {error}"))?;
-    Ok((stream, sample_rate))
+    Ok((stream, sample_rate, device.name().unwrap_or_default()))
+}
+
+/// The device a Start asks for, by name: the named one, or whichever is the
+/// Windows default right now (it can change between takes).
+#[cfg(windows)]
+fn requested_device_name(device_name: &str) -> Option<String> {
+    if !device_name.trim().is_empty() {
+        return Some(device_name.to_string());
+    }
+    cpal::default_host().default_input_device()?.name().ok()
 }
 
 #[cfg(windows)]
@@ -721,25 +725,32 @@ fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
                             silence_auto_stop = enable_silence;
                             current_session = session;
                             // The mic test always gets its own meter stream.
+                            // Compared by the device's real name, so a new
+                            // Windows default is not served by the old stream.
                             let reusable = warm.take().filter(|kept| {
                                 !meter
-                                    && reuse_warm_stream(
-                                        &kept.device,
-                                        &device_name,
-                                        last_audio_ms.load(Ordering::Relaxed) as u128,
-                                        now_ms(),
-                                    )
+                                    && requested_device_name(&device_name).is_some_and(|wanted| {
+                                        reuse_warm_stream(
+                                            &kept.device,
+                                            &wanted,
+                                            last_audio_ms.load(Ordering::Relaxed) as u128,
+                                            now_ms(),
+                                        )
+                                    })
                             });
                             let opened = match reusable {
                                 Some(kept) => {
                                     if let Ok(mut buffer) = samples.lock() {
                                         buffer.clear();
+                                        store.store(true, Ordering::Relaxed);
                                     }
                                     logbuf::debug("Microphone was still open; recording at once.");
-                                    Ok((kept.stream, kept.rate))
+                                    Ok((kept.stream, kept.rate, kept.device))
                                 }
                                 None => {
-                                    store.store(false, Ordering::Relaxed);
+                                    // Storing is on before the stream starts,
+                                    // so its first frames are kept.
+                                    store.store(!meter, Ordering::Relaxed);
                                     open_input_stream(
                                         Arc::clone(&samples),
                                         Arc::clone(&last_voice_ms),
@@ -753,9 +764,8 @@ fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
                                 }
                             };
                             match opened {
-                                Ok((next_stream, rate)) => {
-                                    store.store(!meter, Ordering::Relaxed);
-                                    stream_device = device_name.clone();
+                                Ok((next_stream, rate, resolved)) => {
+                                    stream_device = resolved;
                                     sample_rate = Some(rate);
                                     stream = Some(next_stream);
                                     started_ms = Some(now_ms());
@@ -764,6 +774,7 @@ fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
                                     Ok(())
                                 }
                                 Err(error) => {
+                                    store.store(false, Ordering::Relaxed);
                                     meter_only = false;
                                     Err(error)
                                 }
@@ -805,6 +816,11 @@ fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
                     AudioCommand::Level { reply } => {
                         let level = peak_level.lock().map(|v| *v).unwrap_or(0.0);
                         let _ = reply.send(level);
+                    }
+                    AudioCommand::ReleaseMicrophone => {
+                        if warm.take().is_some() {
+                            logbuf::debug("Microphone closed.");
+                        }
                     }
                     AudioCommand::IsLive { reply } => {
                         let _ = reply.send(stream.is_some() && !meter_only);
@@ -870,8 +886,8 @@ fn take_recording(
     started_ms: &mut Option<u128>,
     samples: &Arc<Mutex<Vec<f32>>>,
 ) -> Result<(Vec<f32>, u32), String> {
-    store.store(false, Ordering::Relaxed);
     let Some(live) = stream.take() else {
+        store.store(false, Ordering::Relaxed);
         return Err("No recording is in progress".into());
     };
     *started_ms = None;
@@ -884,6 +900,8 @@ fn take_recording(
     });
     match samples.lock() {
         Ok(mut buffer) => {
+            // Under the buffer lock, so no callback appends after the hand-off.
+            store.store(false, Ordering::Relaxed);
             let captured = std::mem::take(&mut *buffer);
             if captured.is_empty() {
                 Err("No microphone audio was captured".into())
@@ -981,6 +999,11 @@ impl AudioRecorder {
             .unwrap_or(0.0)
     }
 
+    /// Closes a microphone kept open after a take.
+    fn release_microphone(&self) {
+        let _ = self.commands.send(AudioCommand::ReleaseMicrophone);
+    }
+
     fn capture_live(&self) -> bool {
         let (reply, response) = mpsc::channel();
         if self.commands.send(AudioCommand::IsLive { reply }).is_err() {
@@ -1016,6 +1039,7 @@ impl AudioRecorder {
     fn capture_live(&self) -> bool {
         false
     }
+    fn release_microphone(&self) {}
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2564,7 +2588,8 @@ fn is_stale_stop_error(error: &str) -> bool {
 const WARM_MICROPHONE_MS: u128 = 30_000;
 
 /// Whether a microphone kept open after a take can record the next one: the
-/// same device, and still delivering audio (a stream that went quiet across
+/// same device by name (the Windows default resolved to its current
+/// device), and still delivering audio (a stream that went quiet across
 /// sleep or an unplugged mic is replaced).
 fn reuse_warm_stream(kept_device: &str, requested_device: &str, last_audio_ms: u128, now_ms: u128) -> bool {
     kept_device == requested_device && now_ms.saturating_sub(last_audio_ms) <= 500
@@ -4068,6 +4093,8 @@ fn start_auto_pause_watcher(app: AppHandle) {
                 overlay::hide(&app);
                 let _ = app.emit("recording-changed", false);
                 state.whisper_cache.unload();
+                // A watched app is running: close the microphone too.
+                state.recorder.release_microphone();
                 let app_name = hit.clone().unwrap_or_else(|| "a watched app".into());
                 if let Ok(mut park) = state.park_reason.lock() {
                     *park = ParkReason::AutoPause(app_name.clone());
@@ -4714,10 +4741,10 @@ mod tests {
 
     #[test]
     fn a_warm_microphone_is_reused_only_while_it_still_delivers_audio() {
-        assert!(reuse_warm_stream("", "", 1_000, 1_200));
+        // Names are the devices' real names, the default resolved first.
         assert!(reuse_warm_stream("USB Mic", "USB Mic", 1_000, 1_500));
-        assert!(!reuse_warm_stream("USB Mic", "", 1_000, 1_200), "device changed");
-        assert!(!reuse_warm_stream("", "", 1_000, 2_000), "stream went quiet");
+        assert!(!reuse_warm_stream("USB Mic", "Realtek Mic", 1_000, 1_200), "default changed");
+        assert!(!reuse_warm_stream("USB Mic", "USB Mic", 1_000, 2_000), "stream went quiet");
     }
 
     #[test]
