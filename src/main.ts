@@ -330,6 +330,8 @@ let runtime: RuntimeStatus = {
 };
 let recording = false;
 let recordingHotkey: CaptureTarget | null = null;
+/** The keyboard hook is recording the shortcut (Windows), not this page. */
+let nativeCapture = false;
 let testingDictation = false;
 let testListening = false;
 let testResult = "";
@@ -545,10 +547,16 @@ function modelCards() {
   }).join("");
 }
 
+const SIDE_LABELS: Record<string, string> = {
+  ControlRight: "Right Ctrl", ControlLeft: "Left Ctrl",
+  AltRight: "Right Alt", AltLeft: "Left Alt",
+  ShiftRight: "Right Shift", ShiftLeft: "Left Shift",
+};
+
 function hotkeyLabel(spec = settings.hotkey) {
   const preset = presets.find(entry => entry.id === spec);
   if (preset) return preset.label;
-  return spec || "your hotkey";
+  return SIDE_LABELS[spec] ?? (spec || "your hotkey");
 }
 
 function hotkeyOptions() {
@@ -1163,7 +1171,7 @@ function pageHeader(overline: string, title: string, lede: string, extra = "") {
 }
 
 function captureHint() {
-  return recordingHotkey ? `<p class="recording-hint">Press a key combo, or Escape to cancel.</p>` : "";
+  return recordingHotkey ? `<p class="recording-hint">Press a key combo such as Ctrl+Space, or one side key such as Right Alt. Escape cancels.</p>` : "";
 }
 
 function shortcutsPage() {
@@ -1966,14 +1974,20 @@ async function toggleHotkeyRecording(target: CaptureTarget) {
   if (recordingHotkey) {
     const same = recordingHotkey === target;
     recordingHotkey = null;
-    try { await invoke("resume_hotkey_listener"); } catch { /* ignore */ }
+    nativeCapture = false;
+    try { await invoke("stop_hotkey_capture"); } catch { /* ignore */ }
     if (same) {
       showToast("Shortcut recording cancelled.");
       render();
       return;
     }
   }
-  try { await invoke("pause_hotkey_listener"); } catch { /* ignore */ }
+  // The hook sees keys an IME or this webview would take (Ctrl+Space);
+  // elsewhere the page records them itself.
+  try { nativeCapture = await invoke<boolean>("start_hotkey_capture"); } catch { nativeCapture = false; }
+  if (!nativeCapture) {
+    try { await invoke("pause_hotkey_listener"); } catch { /* ignore */ }
+  }
   recordingHotkey = target;
   render();
 }
@@ -1982,7 +1996,8 @@ function finishHotkeyCapture(spec: string, label: string) {
   const target = recordingHotkey ?? "hotkey";
   settings[target] = spec;
   recordingHotkey = null;
-  void invoke("resume_hotkey_listener").catch(() => undefined);
+  nativeCapture = false;
+  void invoke("stop_hotkey_capture").catch(() => undefined);
   void persistSettings(true, true).then(() => {
     syncSettingsControls();
     render();
@@ -1994,10 +2009,11 @@ function onGlobalKeyDown(event: KeyboardEvent) {
   if (!recordingHotkey) return;
   event.preventDefault();
   event.stopPropagation();
+  if (nativeCapture) return;
   if (event.key === "Escape") {
     recordingHotkey = null;
     showToast("Shortcut recording cancelled.");
-    void invoke("resume_hotkey_listener").catch(() => undefined);
+    void invoke("stop_hotkey_capture").catch(() => undefined);
     render();
     return;
   }
@@ -2024,7 +2040,7 @@ function onGlobalKeyDown(event: KeyboardEvent) {
 }
 
 function onGlobalKeyUp(event: KeyboardEvent) {
-  if (!recordingHotkey) return;
+  if (!recordingHotkey || nativeCapture) return;
   if (event.code === "ControlRight" || event.code === "AltRight" || event.code === "ShiftRight") {
     event.preventDefault();
     event.stopPropagation();
@@ -2037,6 +2053,29 @@ function onGlobalKeyUp(event: KeyboardEvent) {
     }
   }
 }
+
+type CaptureOutcome =
+  | { kind: "shortcut"; value: string }
+  | { kind: "refused"; value: string }
+  | { kind: "cancelled" };
+
+listen<CaptureOutcome>("hotkey-captured", event => {
+  if (!recordingHotkey || !nativeCapture) return;
+  const outcome = event.payload;
+  if (outcome.kind === "shortcut") {
+    finishHotkeyCapture(outcome.value, hotkeyLabel(outcome.value));
+  } else if (outcome.kind === "refused") {
+    // Still recording: the hook waits for another try.
+    showToast(outcome.value);
+    render();
+  } else {
+    recordingHotkey = null;
+    nativeCapture = false;
+    void invoke("stop_hotkey_capture").catch(() => undefined);
+    showToast("Shortcut recording cancelled.");
+    render();
+  }
+}).catch(() => undefined);
 
 async function refreshStatuses() { statuses = await invoke<Record<string, ModelStatus>>("get_model_statuses"); }
 async function refreshHistory() { history = await invoke<HistoryEntry[]>("get_history"); }
