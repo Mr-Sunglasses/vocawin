@@ -17,6 +17,7 @@ mod hotkey;
 mod lang_id;
 mod logbuf;
 mod machine;
+mod model_slot;
 mod output;
 mod overlay;
 mod pipeline;
@@ -1381,11 +1382,17 @@ fn save_settings(
     sounds::apply_theme(&mut settings.sound_theme, &mut settings.sound_effects);
     settings.hotkey = hotkey::canonicalize(&settings.hotkey)?;
     normalize_extra_settings(&mut settings)?;
-    let previous_launch = state
-        .settings
-        .lock()
-        .map_err(|_| "Settings lock was poisoned")?
-        .launch_at_login;
+    let (previous_launch, previous_model) = {
+        let previous = state
+            .settings
+            .lock()
+            .map_err(|_| "Settings lock was poisoned")?;
+        (previous.launch_at_login, previous.selected_model.clone())
+    };
+    if previous_model != settings.selected_model {
+        // Free the old model now rather than at the next take.
+        ONNX_MODELS.unload();
+    }
     persist_settings(&state.settings_path, &settings)?;
     let launch_error = match apply_launch_at_login(&app, settings.launch_at_login) {
         Ok(()) => None,
@@ -2288,6 +2295,8 @@ async fn download_model(
 
 #[tauri::command]
 fn delete_model(model_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    // A kept model holds its files open, and Windows will not delete those.
+    ONNX_MODELS.unload();
     let path = model_path(&state.models_path, &model_id);
     if path.is_dir() {
         fs::remove_dir_all(&path)
@@ -2425,20 +2434,37 @@ fn prompt_language(language: Option<&str>, supported: &[&str]) -> Option<String>
         .map(str::to_owned)
 }
 
-fn transcribe_onnx(
+/// A loaded ONNX model, kept between takes in `ONNX_MODELS`.
+enum OnnxModel {
+    Parakeet(transcribe_rs::onnx::parakeet::ParakeetModel),
+    Moonshine(transcribe_rs::onnx::moonshine::MoonshineModel),
+    SenseVoice(transcribe_rs::onnx::sense_voice::SenseVoiceModel),
+    GigaAM(transcribe_rs::onnx::gigaam::GigaAMModel),
+    Canary(transcribe_rs::onnx::canary::CanaryModel),
+    Cohere(transcribe_rs::onnx::cohere::CohereModel),
+}
+
+/// The ONNX model kept between takes. Loading one took seconds on every
+/// take, after the user stopped speaking; now it happens once, and at the
+/// hotkey press (`preload_selected_model`) rather than after the take.
+static ONNX_MODELS: model_slot::ModelSlot<OnnxModel> = model_slot::ModelSlot::new();
+
+fn onnx_key(model_id: &str, accelerator: transcribe_rs::accel::OrtAccelerator) -> String {
+    format!("{model_id}|{accelerator:?}")
+}
+
+fn load_onnx_model(
     model_id: &str,
-    models_path: &std::path::Path,
-    pcm: &[f32],
-    language: Option<&str>,
+    models_path: &Path,
     accelerator: transcribe_rs::accel::OrtAccelerator,
-) -> Result<String, String> {
+) -> Result<OnnxModel, String> {
     use transcribe_rs::onnx::{
-        canary::{CanaryModel, CanaryParams},
-        cohere::{CohereModel, CohereParams},
+        canary::CanaryModel,
+        cohere::CohereModel,
         gigaam::GigaAMModel,
         moonshine::{MoonshineModel, MoonshineVariant},
-        parakeet::{ParakeetModel, ParakeetParams},
-        sense_voice::{SenseVoiceModel, SenseVoiceParams},
+        parakeet::ParakeetModel,
+        sense_voice::SenseVoiceModel,
         Quantization,
     };
 
@@ -2450,45 +2476,83 @@ fn transcribe_onnx(
             model_path.display()
         ));
     }
-    let text = match model_id {
-        "parakeet-tdt-0.6b-v3" => {
-            let mut model = load_onnx(accelerator, || {
-                ParakeetModel::load(&model_path, &Quantization::Int8)
-            })
-            .map_err(|error| format!("Could not load Parakeet: {error}"))?;
-            decode_parakeet(|lead_in| {
-                let result = if lead_in {
-                    model.transcribe_with(pcm, &ParakeetParams::default())
-                } else {
-                    model.transcribe_raw(pcm, &transcribe_rs::TranscribeOptions::default())
-                };
-                result
-                    .map(|result| result.text)
-                    .map_err(|error| format!("Parakeet transcription failed: {error}"))
-            })?
-        }
+    let started = std::time::Instant::now();
+    let model = match model_id {
+        "parakeet-tdt-0.6b-v3" => load_onnx(accelerator, || {
+            ParakeetModel::load(&model_path, &Quantization::Int8)
+        })
+        .map(OnnxModel::Parakeet)
+        .map_err(|error| format!("Could not load Parakeet: {error}"))?,
         "moonshine-tiny" | "moonshine-base" => {
             let variant = if model_id == "moonshine-tiny" {
                 MoonshineVariant::Tiny
             } else {
                 MoonshineVariant::Base
             };
-            let mut model = load_onnx(accelerator, || {
+            load_onnx(accelerator, || {
                 MoonshineModel::load(&model_path, variant, &Quantization::default())
             })
-            .map_err(|error| format!("Could not load Moonshine: {error}"))?;
-            decode_in_windows(pcm, |window| {
-                model
-                    .transcribe(window, &transcribe_rs::TranscribeOptions::default())
-                    .map(|result| result.text)
-                    .map_err(|error| format!("Moonshine transcription failed: {error}"))
-            })?
+            .map(OnnxModel::Moonshine)
+            .map_err(|error| format!("Could not load Moonshine: {error}"))?
         }
-        "sensevoice-small" => {
-            let mut model = load_onnx(accelerator, || {
-                SenseVoiceModel::load(&model_path, &Quantization::Int8)
-            })
-            .map_err(|error| format!("Could not load SenseVoice: {error}"))?;
+        "sensevoice-small" => load_onnx(accelerator, || {
+            SenseVoiceModel::load(&model_path, &Quantization::Int8)
+        })
+        .map(OnnxModel::SenseVoice)
+        .map_err(|error| format!("Could not load SenseVoice: {error}"))?,
+        "gigaam-v3" => load_onnx(accelerator, || {
+            GigaAMModel::load(&model_path, &Quantization::Int8)
+        })
+        .map(OnnxModel::GigaAM)
+        .map_err(|error| format!("Could not load GigaAM: {error}"))?,
+        "canary-180m" | "canary-1b-v2" => load_onnx(accelerator, || {
+            CanaryModel::load(&model_path, &Quantization::Int8)
+        })
+        .map(OnnxModel::Canary)
+        .map_err(|error| format!("Could not load Canary: {error}"))?,
+        "cohere-transcribe" => load_onnx(accelerator, || {
+            CohereModel::load(&model_path, &Quantization::Int4)
+        })
+        .map(OnnxModel::Cohere)
+        .map_err(|error| format!("Could not load Cohere Transcribe: {error}"))?,
+        _ => return Err(format!("The {} adapter is not available yet.", model_id)),
+    };
+    logbuf::debug(format!(
+        "Loaded {model_id} ({accelerator:?}) in {} ms.",
+        started.elapsed().as_millis()
+    ));
+    Ok(model)
+}
+
+fn decode_onnx(
+    model: &mut OnnxModel,
+    model_id: &str,
+    pcm: &[f32],
+    language: Option<&str>,
+) -> Result<String, String> {
+    use transcribe_rs::onnx::{
+        canary::CanaryParams, cohere::CohereParams, parakeet::ParakeetParams,
+        sense_voice::SenseVoiceParams,
+    };
+
+    let text = match model {
+        OnnxModel::Parakeet(model) => decode_parakeet(|lead_in| {
+            let result = if lead_in {
+                model.transcribe_with(pcm, &ParakeetParams::default())
+            } else {
+                model.transcribe_raw(pcm, &transcribe_rs::TranscribeOptions::default())
+            };
+            result
+                .map(|result| result.text)
+                .map_err(|error| format!("Parakeet transcription failed: {error}"))
+        })?,
+        OnnxModel::Moonshine(model) => decode_in_windows(pcm, |window| {
+            model
+                .transcribe(window, &transcribe_rs::TranscribeOptions::default())
+                .map(|result| result.text)
+                .map_err(|error| format!("Moonshine transcription failed: {error}"))
+        })?,
+        OnnxModel::SenseVoice(model) => {
             model
                 .transcribe_with(
                     pcm,
@@ -2500,23 +2564,13 @@ fn transcribe_onnx(
                 .map_err(|error| format!("SenseVoice transcription failed: {error}"))?
                 .text
         }
-        "gigaam-v3" => {
-            let mut model = load_onnx(accelerator, || {
-                GigaAMModel::load(&model_path, &Quantization::Int8)
-            })
-            .map_err(|error| format!("Could not load GigaAM: {error}"))?;
-            decode_in_windows(pcm, |window| {
-                model
-                    .transcribe(window, &transcribe_rs::TranscribeOptions::default())
-                    .map(|result| result.text)
-                    .map_err(|error| format!("GigaAM transcription failed: {error}"))
-            })?
-        }
-        "canary-180m" | "canary-1b-v2" => {
-            let mut model = load_onnx(accelerator, || {
-                CanaryModel::load(&model_path, &Quantization::Int8)
-            })
-            .map_err(|error| format!("Could not load Canary: {error}"))?;
+        OnnxModel::GigaAM(model) => decode_in_windows(pcm, |window| {
+            model
+                .transcribe(window, &transcribe_rs::TranscribeOptions::default())
+                .map(|result| result.text)
+                .map_err(|error| format!("GigaAM transcription failed: {error}"))
+        })?,
+        OnnxModel::Canary(model) => {
             let supported = if model_id == "canary-1b-v2" {
                 CANARY_V2_LANGUAGES
             } else {
@@ -2533,11 +2587,7 @@ fn transcribe_onnx(
                     .map_err(|error| format!("Canary transcription failed: {error}"))
             })?
         }
-        "cohere-transcribe" => {
-            let mut model = load_onnx(accelerator, || {
-                CohereModel::load(&model_path, &Quantization::Int4)
-            })
-            .map_err(|error| format!("Could not load Cohere Transcribe: {error}"))?;
+        OnnxModel::Cohere(model) => {
             let params = CohereParams {
                 language: prompt_language(language, COHERE_LANGUAGES),
                 ..CohereParams::default()
@@ -2551,9 +2601,26 @@ fn transcribe_onnx(
                     .map_err(|error| format!("Cohere transcription failed: {error}"))
             })?
         }
-        _ => return Err(format!("The {} adapter is not available yet.", model_id)),
     };
     Ok(text.trim().to_string())
+}
+
+/// Decodes with the kept model, loading it first when it is not kept. A
+/// model goes back only after a good decode, so a failure never sticks.
+fn transcribe_onnx(
+    model_id: &str,
+    models_path: &Path,
+    pcm: &[f32],
+    language: Option<&str>,
+    accelerator: transcribe_rs::accel::OrtAccelerator,
+) -> Result<String, String> {
+    let key = onnx_key(model_id, accelerator);
+    let mut model = ONNX_MODELS.take(&key, || load_onnx_model(model_id, models_path, accelerator))?;
+    let text = decode_onnx(&mut model, model_id, pcm, language);
+    if text.is_ok() {
+        ONNX_MODELS.put(&key, model);
+    }
+    text
 }
 
 /// Parakeet's decode rule. `decode(true)` is transcribe-rs's usual path,
@@ -2763,6 +2830,7 @@ fn begin_voice_session(
         logbuf::error_and_emit(app, error.clone());
         return Err(error);
     }
+    preload_selected_model(&state, &settings);
     state.session_opening.store(true, Ordering::SeqCst);
     state.release_during_open.store(false, Ordering::SeqCst);
     let session = state.session_id.fetch_add(1, Ordering::SeqCst) + 1;
@@ -3036,11 +3104,7 @@ fn transcribe_onnx_accelerated(
 ) -> Result<String, String> {
     use transcribe_rs::accel::OrtAccelerator;
 
-    let directml = cfg!(windows)
-        && onnx_uses_directml(model_id)
-        && model_is_installed(models_path, model_id)
-        && !DIRECTML_FAILED.load(Ordering::Relaxed)
-        && gpu::detect_gpu().available;
+    let directml = onnx_tries_directml(model_id, models_path);
     let (result, directml_broken) = decode_with_cpu_fallback(directml, |gpu| {
         let accelerator = if gpu {
             OrtAccelerator::DirectMl
@@ -3050,7 +3114,7 @@ fn transcribe_onnx_accelerated(
         let started = std::time::Instant::now();
         let result = transcribe_onnx(model_id, models_path, pcm, language, accelerator);
         logbuf::debug(format!(
-            "{model_id} on {}: {} ms for {:.1} s of audio (load included).",
+            "{model_id} on {}: {} ms for {:.1} s of audio (includes a load if it was not kept).",
             if gpu { "DirectML" } else { "CPU" },
             started.elapsed().as_millis(),
             pcm.len() as f32 / 16_000.0
@@ -3064,6 +3128,48 @@ fn transcribe_onnx_accelerated(
         ));
     }
     result
+}
+
+/// Whether a take of `model_id` tries DirectML first.
+fn onnx_tries_directml(model_id: &str, models_path: &Path) -> bool {
+    cfg!(windows)
+        && onnx_uses_directml(model_id)
+        && model_is_installed(models_path, model_id)
+        && !DIRECTML_FAILED.load(Ordering::Relaxed)
+        && gpu::detect_gpu().available
+}
+
+/// Starts loading the selected model when the hotkey goes down, so it loads
+/// while the user speaks instead of after (Handy does the same). A take
+/// that ends first waits for this load rather than starting its own.
+fn preload_selected_model(state: &AppState, settings: &Settings) {
+    let model_id = settings.selected_model.clone();
+    if is_whisper_model(&model_id) {
+        let gpu = gpu::detect_gpu();
+        state.whisper_cache.preload(
+            state.models_path.join(format!("{model_id}.bin")),
+            cfg!(vocawin_whisper_vulkan) && gpu.available,
+            gpu.device_index,
+        );
+        return;
+    }
+    let models_path = state.models_path.clone();
+    let _ = std::thread::Builder::new()
+        .name("vocawin-preload".into())
+        .spawn(move || {
+            use transcribe_rs::accel::OrtAccelerator;
+            let accelerator = if onnx_tries_directml(&model_id, &models_path) {
+                OrtAccelerator::DirectMl
+            } else {
+                OrtAccelerator::CpuOnly
+            };
+            let key = onnx_key(&model_id, accelerator);
+            if let Err(error) =
+                ONNX_MODELS.preload(&key, || load_onnx_model(&model_id, &models_path, accelerator))
+            {
+                logbuf::debug(format!("Preload of {model_id} failed: {error}"));
+            }
+        });
 }
 
 /// Decodes on the GPU first when `gpu` is set, then on CPU if that fails.
@@ -3610,7 +3716,7 @@ fn runtime_status_value(state: &AppState) -> serde_json::Value {
         .lock()
         .map(|reason| reason.clone())
         .unwrap_or_default();
-    let model_loaded = state.whisper_cache.is_loaded();
+    let model_loaded = state.whisper_cache.is_loaded() || ONNX_MODELS.is_loaded();
     let gpu = gpu::detect_gpu();
     let status = if recording {
         "Recording"
@@ -4179,6 +4285,7 @@ fn start_auto_pause_watcher(app: AppHandle) {
                 state.whisper_cache.unload();
                 // A watched app is running: close the microphone too.
                 state.recorder.release_microphone();
+                ONNX_MODELS.unload();
                 let app_name = hit.clone().unwrap_or_else(|| "a watched app".into());
                 if let Ok(mut park) = state.park_reason.lock() {
                     *park = ParkReason::AutoPause(app_name.clone());
@@ -4208,7 +4315,12 @@ fn start_auto_pause_watcher(app: AppHandle) {
                 drop(paused);
             }
 
-            let loaded = state.whisper_cache.is_loaded();
+            if settings.idle_unload_enabled {
+                ONNX_MODELS.unload_if_idle(std::time::Duration::from_secs(
+                    settings.idle_unload_seconds.max(30) as u64,
+                ));
+            }
+            let loaded = state.whisper_cache.is_loaded() || ONNX_MODELS.is_loaded();
             let mut prev_loaded = match state.saw_model_loaded.lock() {
                 Ok(guard) => guard,
                 Err(_) => continue,
@@ -4221,7 +4333,7 @@ fn start_auto_pause_watcher(app: AppHandle) {
                     if let Ok(mut park) = state.park_reason.lock() {
                         if *park == ParkReason::None {
                             *park = ParkReason::IdleTimeout;
-                            logbuf::info_and_emit(&app, "Unloaded Whisper after idle.");
+                            logbuf::info_and_emit(&app, "Unloaded the speech model after idle.");
                             tray_dirty = true;
                         }
                     }
