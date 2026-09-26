@@ -1063,7 +1063,13 @@ fn complete_take(
             Ok(String::new())
         }
         Ok(take) => {
-            let mut delivered = Ok(take.text.clone());
+            // A take with no words is an error, not a silent no-op, so the
+            // overlay, the error sound and the window all say so.
+            let mut delivered = if take.text.trim().is_empty() {
+                Err(NO_SPEECH.to_string())
+            } else {
+                Ok(take.text.clone())
+            };
             if inject && !take.text.is_empty() {
                 if let Ok(mut last) = state.last_dictation.lock() {
                     *last = take.text.clone();
@@ -1086,10 +1092,6 @@ fn complete_take(
                 _ => {}
             }
             delivered
-        }
-        Err(error) if cancelled && error == NO_SPEECH => {
-            logbuf::info_and_emit(app, "Cancelled take was not typed.");
-            Ok(String::new())
         }
         Err(error) => {
             if inject {
@@ -2573,17 +2575,18 @@ fn transcribe_samples(state: &AppState, samples: Vec<f32>, sample_rate: u32) -> 
     } else {
         None
     };
-    // A take with no words is an error, not a silent no-op, so the overlay,
-    // the error sound and History all say nothing was typed.
-    let result = recognize_and_format(state, &settings, &pcm).and_then(|text| {
-        if text.trim().is_empty() {
-            Err(NO_SPEECH.into())
-        } else {
-            Ok(text)
-        }
-    });
+    let result = recognize_and_format(state, &settings, &pcm);
     if let Some(id) = history_id {
         let saved = match &result {
+            // Failed in History; `complete_take` reports it once it knows
+            // the take was not cancelled.
+            Ok(text) if text.trim().is_empty() => state.history.finish(
+                id,
+                "",
+                &settings.selected_model,
+                history::STATUS_FAILED,
+                Some(NO_SPEECH.into()),
+            ),
             Ok(text) => state.history.finish(
                 id,
                 text,
