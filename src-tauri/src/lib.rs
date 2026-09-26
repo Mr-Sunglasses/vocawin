@@ -2093,11 +2093,29 @@ fn resample_to_16khz(samples: &[f32], source_rate: u32) -> Vec<f32> {
         .collect()
 }
 
+/// Held while an ONNX model loads. transcribe-rs reads its process-wide
+/// accelerator when a session is built, so setting it and loading happen
+/// together; decoding runs outside the lock, so a history retry and a live
+/// take only wait for each other's load, never a whole decode.
+static ONNX_LOAD: Mutex<()> = Mutex::new(());
+
+fn load_onnx<M>(
+    accelerator: transcribe_rs::accel::OrtAccelerator,
+    load: impl FnOnce() -> Result<M, transcribe_rs::TranscribeError>,
+) -> Result<M, transcribe_rs::TranscribeError> {
+    let _load = ONNX_LOAD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    transcribe_rs::accel::set_ort_accelerator(accelerator);
+    load()
+}
+
 fn transcribe_onnx(
     model_id: &str,
     models_path: &std::path::Path,
     pcm: &[f32],
     language: Option<&str>,
+    accelerator: transcribe_rs::accel::OrtAccelerator,
 ) -> Result<String, String> {
     use transcribe_rs::onnx::{
         canary::{CanaryModel, CanaryParams},
@@ -2118,8 +2136,10 @@ fn transcribe_onnx(
     }
     let text = match model_id {
         "parakeet-tdt-0.6b-v3" => {
-            let mut model = ParakeetModel::load(&model_path, &Quantization::Int8)
-                .map_err(|error| format!("Could not load Parakeet: {error}"))?;
+            let mut model = load_onnx(accelerator, || {
+                ParakeetModel::load(&model_path, &Quantization::Int8)
+            })
+            .map_err(|error| format!("Could not load Parakeet: {error}"))?;
             model
                 .transcribe_with(pcm, &ParakeetParams::default())
                 .map_err(|error| format!("Parakeet transcription failed: {error}"))?
@@ -2131,8 +2151,10 @@ fn transcribe_onnx(
             } else {
                 MoonshineVariant::Base
             };
-            let mut model = MoonshineModel::load(&model_path, variant, &Quantization::default())
-                .map_err(|error| format!("Could not load Moonshine: {error}"))?;
+            let mut model = load_onnx(accelerator, || {
+                MoonshineModel::load(&model_path, variant, &Quantization::default())
+            })
+            .map_err(|error| format!("Could not load Moonshine: {error}"))?;
             decode_in_windows(pcm, |window| {
                 model
                     .transcribe(window, &transcribe_rs::TranscribeOptions::default())
@@ -2141,8 +2163,10 @@ fn transcribe_onnx(
             })?
         }
         "sensevoice-small" => {
-            let mut model = SenseVoiceModel::load(&model_path, &Quantization::Int8)
-                .map_err(|error| format!("Could not load SenseVoice: {error}"))?;
+            let mut model = load_onnx(accelerator, || {
+                SenseVoiceModel::load(&model_path, &Quantization::Int8)
+            })
+            .map_err(|error| format!("Could not load SenseVoice: {error}"))?;
             model
                 .transcribe_with(
                     pcm,
@@ -2155,8 +2179,10 @@ fn transcribe_onnx(
                 .text
         }
         "gigaam-v3" => {
-            let mut model = GigaAMModel::load(&model_path, &Quantization::Int8)
-                .map_err(|error| format!("Could not load GigaAM: {error}"))?;
+            let mut model = load_onnx(accelerator, || {
+                GigaAMModel::load(&model_path, &Quantization::Int8)
+            })
+            .map_err(|error| format!("Could not load GigaAM: {error}"))?;
             decode_in_windows(pcm, |window| {
                 model
                     .transcribe(window, &transcribe_rs::TranscribeOptions::default())
@@ -2165,8 +2191,10 @@ fn transcribe_onnx(
             })?
         }
         "canary-180m" => {
-            let mut model = CanaryModel::load(&model_path, &Quantization::Int8)
-                .map_err(|error| format!("Could not load Canary: {error}"))?;
+            let mut model = load_onnx(accelerator, || {
+                CanaryModel::load(&model_path, &Quantization::Int8)
+            })
+            .map_err(|error| format!("Could not load Canary: {error}"))?;
             decode_in_windows(pcm, |window| {
                 model
                     .transcribe_with(window, &CanaryParams::default())
@@ -2590,18 +2618,13 @@ static DIRECTML_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// `transcribe_onnx` on DirectML when the model and the PC support it, and
 /// on CPU when they do not or DirectML fails.
-///
-/// transcribe-rs keeps the accelerator in one process-wide setting that it
-/// reads when a model loads. A history retry can overlap a live take, but
-/// both decode the selected model and so ask for the same setting; the
-/// rare overlap around a DirectML failure can only put a take on CPU.
 fn transcribe_onnx_accelerated(
     model_id: &str,
     models_path: &Path,
     pcm: &[f32],
     language: Option<&str>,
 ) -> Result<String, String> {
-    use transcribe_rs::accel::{set_ort_accelerator, OrtAccelerator};
+    use transcribe_rs::accel::OrtAccelerator;
 
     let directml = cfg!(windows)
         && onnx_uses_directml(model_id)
@@ -2609,12 +2632,12 @@ fn transcribe_onnx_accelerated(
         && !DIRECTML_FAILED.load(Ordering::Relaxed)
         && gpu::detect_gpu().available;
     let (result, directml_broken) = decode_with_cpu_fallback(directml, |gpu| {
-        set_ort_accelerator(if gpu {
+        let accelerator = if gpu {
             OrtAccelerator::DirectMl
         } else {
             OrtAccelerator::CpuOnly
-        });
-        transcribe_onnx(model_id, models_path, pcm, language)
+        };
+        transcribe_onnx(model_id, models_path, pcm, language, accelerator)
     });
     if directml_broken {
         DIRECTML_FAILED.store(true, Ordering::Relaxed);
@@ -4087,6 +4110,33 @@ mod tests {
         assert!(!catalog
             .iter()
             .any(|m| m.id.contains("vosk") || m.id.contains("ctc")));
+    }
+
+    #[test]
+    fn a_model_loads_with_the_accelerator_it_asked_for() {
+        use transcribe_rs::accel::{get_ort_accelerator, OrtAccelerator};
+        let threads: Vec<_> = (0..8)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    let wanted = if index % 2 == 0 {
+                        OrtAccelerator::DirectMl
+                    } else {
+                        OrtAccelerator::CpuOnly
+                    };
+                    for _ in 0..50 {
+                        let seen = load_onnx(wanted, || {
+                            std::thread::yield_now();
+                            Ok::<_, transcribe_rs::TranscribeError>(get_ort_accelerator())
+                        })
+                        .unwrap();
+                        assert_eq!(seen, wanted);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
     }
 
     #[test]
