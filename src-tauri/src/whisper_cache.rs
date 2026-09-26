@@ -22,6 +22,13 @@ enum CacheCommand {
         initial_prompt: String,
         reply: mpsc::Sender<Result<String, String>>,
     },
+    /// Load a model ahead of its take (hotkey press). Queued before the
+    /// take's Transcribe, so that take finds it loaded.
+    Preload {
+        model_path: PathBuf,
+        use_gpu: bool,
+        gpu_device: i32,
+    },
     Unload,
     ConfigureIdle {
         enabled: bool,
@@ -73,6 +80,15 @@ impl WhisperCache {
             .map_err(|_| "Whisper cache thread did not respond".to_string())?
     }
 
+    /// Starts loading `model_path` without waiting for it.
+    pub fn preload(&self, model_path: PathBuf, use_gpu: bool, gpu_device: i32) {
+        let _ = self.commands.send(CacheCommand::Preload {
+            model_path,
+            use_gpu,
+            gpu_device,
+        });
+    }
+
     pub fn configure_idle(&self, enabled: bool, seconds: u32) {
         let _ = self
             .commands
@@ -121,6 +137,18 @@ fn cache_thread_main(commands: mpsc::Receiver<CacheCommand>, loaded: Arc<AtomicB
                 let _ = reply.send(result);
                 false
             }
+            Ok(CacheCommand::Preload {
+                model_path,
+                use_gpu,
+                gpu_device,
+            }) => {
+                match ensure_loaded(&mut loaded_path, &mut context, &model_path, use_gpu, gpu_device) {
+                    Ok(()) => last_used = Instant::now(),
+                    Err(error) => crate::logbuf::debug(format!("Whisper preload failed: {error}")),
+                }
+                loaded.store(context.is_some(), Ordering::Relaxed);
+                false
+            }
             Ok(CacheCommand::Unload) => {
                 if loaded_path.is_some() {
                     crate::logbuf::info("Whisper model unloaded.");
@@ -153,6 +181,37 @@ fn cache_thread_main(commands: mpsc::Receiver<CacheCommand>, loaded: Arc<AtomicB
     }
 }
 
+/// Loads `model_path` unless it is the model already loaded.
+fn ensure_loaded(
+    loaded_path: &mut Option<PathBuf>,
+    context: &mut Option<whisper_rs::WhisperContext>,
+    model_path: &PathBuf,
+    use_gpu: bool,
+    gpu_device: i32,
+) -> Result<(), String> {
+    if context.is_some() && loaded_path.as_ref() == Some(model_path) {
+        return Ok(());
+    }
+    let mut context_params = whisper_rs::WhisperContextParameters::default();
+    context_params.use_gpu(use_gpu);
+    context_params.gpu_device(if gpu_device >= 0 { gpu_device } else { 0 });
+    let next = whisper_rs::WhisperContext::new_with_params(
+        model_path.to_string_lossy().as_ref(),
+        context_params,
+    )
+    .map_err(|error| format!("Could not load Whisper model: {error}"))?;
+    *context = Some(next);
+    *loaded_path = Some(model_path.clone());
+    crate::logbuf::info(format!(
+        "Loaded Whisper model {} (gpu={use_gpu}, device={gpu_device})",
+        model_path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("whisper")
+    ));
+    Ok(())
+}
+
 fn run_transcribe(
     loaded_path: &mut Option<PathBuf>,
     context: &mut Option<whisper_rs::WhisperContext>,
@@ -164,30 +223,7 @@ fn run_transcribe(
     keep_alive: bool,
     initial_prompt: &str,
 ) -> Result<String, String> {
-    let needs_reload = context.is_none()
-        || loaded_path
-            .as_ref()
-            .map(|path| path != model_path)
-            .unwrap_or(true);
-    if needs_reload {
-        let mut context_params = whisper_rs::WhisperContextParameters::default();
-        context_params.use_gpu(use_gpu);
-        context_params.gpu_device(if gpu_device >= 0 { gpu_device } else { 0 });
-        let next = whisper_rs::WhisperContext::new_with_params(
-            model_path.to_string_lossy().as_ref(),
-            context_params,
-        )
-        .map_err(|error| format!("Could not load Whisper model: {error}"))?;
-        *context = Some(next);
-        *loaded_path = Some(model_path.clone());
-        crate::logbuf::info(format!(
-            "Loaded Whisper model {} (gpu={use_gpu}, device={gpu_device})",
-            model_path
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .unwrap_or("whisper")
-        ));
-    }
+    ensure_loaded(loaded_path, context, model_path, use_gpu, gpu_device)?;
     let ctx = context
         .as_ref()
         .ok_or("Whisper context missing after load")?;
