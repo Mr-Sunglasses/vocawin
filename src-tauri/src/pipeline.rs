@@ -100,14 +100,17 @@ pub fn process(raw: &str, options: &TextOptions) -> String {
     }
 
     if options.cleanup {
-        let english = match options.language {
+        // Without a language from the setting or the model, a confident
+        // detection decides; the English-word heuristic only when unsure.
+        let detected = options.language.or_else(|| crate::lang_id::detect(&input));
+        let english = match detected {
             Some(code) => code.split('-').next() == Some("en"),
             None => likely_english(&input),
         };
         let (text, removed) = if english {
             cleanup::remove_hesitations(&input)
         } else {
-            cleanup::remove_other_language_hesitations(&input, options.language)
+            cleanup::remove_other_language_hesitations(&input, detected)
         };
         input = text;
         if removed && input.trim().is_empty() {
@@ -263,5 +266,17 @@ mod tests {
         assert!(likely_english("Uh"));
         assert!(!likely_english("wir treffen uns um fünf Uhr heute"));
         assert!(!likely_english("मुझे तीन कॉपी चाहिए"));
+    }
+
+    #[test]
+    fn detected_german_keeps_its_um() {
+        let opts = options();
+        // "ok" made the old heuristic call this English and delete "um".
+        let german = "Ich habe um fünf Uhr ein Meeting mit dem ganzen Team, ok";
+        assert!(process(german, &opts).contains(" um fünf"));
+        assert_eq!(
+            process("So um I think we should ship it on Friday", &opts),
+            "So I think we should ship it on Friday"
+        );
     }
 }
