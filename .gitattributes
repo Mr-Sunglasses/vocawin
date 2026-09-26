@@ -2,3 +2,6 @@
 # VocaMac and VocaPhone copies; keep LF on every checkout.
 src-tauri/tests/fixtures/** text eol=lf
 src-tauri/resources/emoji/** text eol=lf
+
+# Bundled Silero VAD model (see silero_vad_v4.LICENSE).
+src-tauri/resources/*.onnx binary

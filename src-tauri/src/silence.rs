@@ -6,11 +6,11 @@
 //! (Whisper's "Thank you." on a silent clip). A recording with no signal at
 //! all is never decoded.
 //!
-//! VocaMac finds speech with Silero VAD. VocaWin has no VAD model on disk, so
-//! this uses frame energy against the recording's own noise floor. The
-//! decision and assembly rules are VocaMac's: pad speech by 0.2 s, keep at
-//! most 0.4 s of each pause, and leave the audio alone when trimming would
-//! save less than 10 %, or when it is unsure.
+//! Speech is found with Silero VAD, as on VocaMac (`vad.rs`). If the
+//! detector cannot run, frame energy against the recording's own noise floor
+//! (`decide`) stands in. The decision and assembly rules are VocaMac's: pad
+//! speech by 0.2 s, keep at most 0.4 s of each pause, and leave the audio
+//! alone when trimming would save less than 10 %, or when it is unsure.
 
 use std::ops::Range;
 
@@ -93,6 +93,24 @@ pub fn decide(samples: &[f32]) -> Decision {
         })
         .collect();
     plan(speech, samples.len())
+}
+
+/// VocaMac's decision from a voice detector's padded speech ranges: with no
+/// ranges, a peak probability under `no_speech` means silence, and anything
+/// higher (quiet or whispered speech) is left to the model.
+pub fn plan_detected(
+    speech: Vec<Range<usize>>,
+    peak_probability: f32,
+    no_speech: f32,
+    total: usize,
+) -> Decision {
+    if total == 0 {
+        return Decision::NoSpeech;
+    }
+    match plan(speech, total) {
+        Decision::Keep if peak_probability < no_speech => Decision::NoSpeech,
+        decision => decision,
+    }
 }
 
 /// VocaMac's decision from padded speech ranges.

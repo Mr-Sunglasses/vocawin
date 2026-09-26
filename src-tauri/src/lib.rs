@@ -26,6 +26,7 @@ mod sounds;
 mod spoken_emoji;
 mod spoken_numbers;
 mod stats;
+mod vad;
 mod vocabulary;
 mod whisper_cache;
 
@@ -2844,7 +2845,11 @@ fn transcribe_samples(state: &AppState, samples: Vec<f32>, sample_rate: u32) -> 
 /// Silence trim, the model, then the text rules.
 fn recognize_and_format(state: &AppState, settings: &Settings, pcm: &[f32]) -> Result<String, String> {
     let audio = if settings.skip_silence {
-        match silence::decide(pcm) {
+        let decision = vad::decide(pcm).unwrap_or_else(|error| {
+            logbuf::warn(format!("{error}; trimming silence by loudness instead."));
+            silence::decide(pcm)
+        });
+        match decision {
             silence::Decision::NoSpeech => {
                 logbuf::debug("No speech in the recording; skipped the model.");
                 return Ok(String::new());
