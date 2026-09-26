@@ -203,6 +203,18 @@ fn capture_step(capture: &mut Capture, vk: u32, edge: KeyEdge) -> (bool, Option<
                     )),
                 );
             }
+            // AltGr is Left Ctrl + Right Alt on layouts that type with it; a
+            // Ctrl+Alt shortcut would eat those characters (AGENTS.md).
+            if held_modifiers.contains(&crate::hotkey::VK_RMENU)
+                && held_modifiers.contains(&crate::hotkey::VK_LCONTROL)
+            {
+                return (
+                    true,
+                    Some(CaptureOutcome::Refused(
+                        "AltGr types characters on this keyboard, so it cannot be part of a shortcut. Try Ctrl+Space, or Right Alt alone.".into(),
+                    )),
+                );
+            }
             let ctrl = held_modifiers.iter().any(|held| is_ctrl_vk(*held));
             let alt = held_modifiers.iter().any(|held| is_alt_vk(*held));
             let shift = held_modifiers.iter().any(|held| is_shift_vk(*held));
@@ -397,8 +409,33 @@ pub fn begin_capture() -> bool {
     if !cfg!(windows) || !HOOK_ACTIVE.load(Ordering::SeqCst) {
         return false;
     }
-    guard.capture = Some(Capture::new(Instant::now()));
+    let started = Instant::now();
+    guard.capture = Some(Capture::new(started));
+    drop(guard);
+    // Ends a capture nobody finishes even if no key is pressed again.
+    let _ = std::thread::Builder::new()
+        .name("vocawin-capture-timeout".into())
+        .spawn(move || {
+            std::thread::sleep(CAPTURE_TIMEOUT);
+            let mut guard = shared().lock().unwrap_or_else(|e| e.into_inner());
+            if expire_capture(&mut guard, started) {
+                send_captured(CaptureOutcome::Cancelled);
+            }
+        });
     true
+}
+
+/// Ends the capture begun at `started` if it is still waiting for keys.
+fn expire_capture(guard: &mut HookShared, started: Instant) -> bool {
+    let waiting = guard
+        .capture
+        .as_ref()
+        .is_some_and(|capture| capture.started == started && !capture.finished);
+    if waiting {
+        guard.capture = None;
+        guard.capture_paused = false;
+    }
+    waiting
 }
 
 /// Stop capturing and let dictation shortcuts work again. A finished
@@ -742,11 +779,10 @@ unsafe extern "system" fn low_level_proc(
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        if let Some(eat) = capture_key(&mut guard, vk, edge, Instant::now()) {
-            if eat {
-                return LRESULT(1);
-            }
-            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        // A key the capture does not eat goes on as usual (dictation cannot
+        // start while capturing), so a shortcut's latch still clears.
+        if capture_key(&mut guard, vk, edge, Instant::now()) == Some(true) {
+            return LRESULT(1);
         }
         match escape_action(&mut guard, vk, edge) {
             SpecialAction::Pass => {}
@@ -1246,6 +1282,7 @@ mod tests {
     }
 
     use crate::hotkey::{VK_LCONTROL, VK_LSHIFT, VK_RCONTROL, VK_SPACE};
+    const VK_RMENU_TEST: u32 = crate::hotkey::VK_RMENU;
 
     fn run(capture: &mut Capture, keys: &[(u32, KeyEdge)]) -> Vec<(bool, Option<CaptureOutcome>)> {
         keys.iter().map(|(vk, edge)| capture_step(capture, *vk, *edge)).collect()
@@ -1334,6 +1371,43 @@ mod tests {
         let mut capture = Capture::new(Instant::now());
         let steps = run(&mut capture, &[(VK_LMENU, KeyEdge::Down), (VK_ESCAPE, KeyEdge::Down)]);
         assert!(matches!(steps[1].1, Some(CaptureOutcome::Refused(_))));
+    }
+
+    #[test]
+    fn altgr_with_a_key_is_refused() {
+        let mut capture = Capture::new(Instant::now());
+        let steps = run(
+            &mut capture,
+            &[(VK_LCONTROL, KeyEdge::Down), (VK_RMENU_TEST, KeyEdge::Down), (0x51, KeyEdge::Down)],
+        );
+        assert!(matches!(steps[2].1, Some(CaptureOutcome::Refused(_))));
+        assert!(!capture.finished);
+    }
+
+    #[test]
+    fn a_waiting_capture_expires_without_another_key() {
+        let mut shared = test_shared();
+        let started = Instant::now();
+        shared.capture = Some(Capture::new(started));
+        shared.capture_paused = true;
+        assert!(!expire_capture(&mut shared, Instant::now() + CAPTURE_TIMEOUT), "another capture");
+        assert!(expire_capture(&mut shared, started));
+        assert!(shared.capture.is_none() && !shared.capture_paused);
+        assert!(!expire_capture(&mut shared, started), "only once");
+    }
+
+    #[test]
+    fn a_shortcut_released_during_capture_unlatches() {
+        let mut shared = test_shared();
+        shared.latched = vec![crate::hotkey::VK_F9];
+        shared.capture = Some(Capture::new(Instant::now()));
+        shared.capture_paused = true;
+        let f9 = crate::hotkey::VK_F9;
+        assert_eq!(capture_key(&mut shared, f9, KeyEdge::Up, Instant::now()), Some(false));
+        // The hook then runs shortcut_action, which clears the latch.
+        let never = |_: &HotkeySpec, _: u32| false;
+        assert_eq!(shortcut_action(&mut shared, f9, KeyEdge::Up, never), SpecialAction::Swallow);
+        assert!(shared.latched.is_empty());
     }
 
     #[test]

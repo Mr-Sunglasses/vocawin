@@ -1629,6 +1629,7 @@ function render() {
 }
 
 function openView(next: View) {
+  if (next !== view) cancelHotkeyRecording();
   view = next;
   resetPaneScroll = true;
   if (searchQuery() && !pageMatchCounts().has(next)) {
@@ -1983,13 +1984,23 @@ async function toggleHotkeyRecording(target: CaptureTarget) {
     }
   }
   // The hook sees keys an IME or this webview would take (Ctrl+Space);
-  // elsewhere the page records them itself.
+  // elsewhere the page records them itself. The target is set first so a
+  // result that arrives before the command returns is not dropped.
+  recordingHotkey = target;
+  nativeCapture = true;
+  render();
   try { nativeCapture = await invoke<boolean>("start_hotkey_capture"); } catch { nativeCapture = false; }
-  if (!nativeCapture) {
+  if (!nativeCapture && recordingHotkey === target) {
     try { await invoke("pause_hotkey_listener"); } catch { /* ignore */ }
   }
-  recordingHotkey = target;
-  render();
+}
+
+/** Leaving the page mid-recording must not keep capturing keys. */
+function cancelHotkeyRecording() {
+  if (!recordingHotkey) return;
+  recordingHotkey = null;
+  nativeCapture = false;
+  void invoke("stop_hotkey_capture").catch(() => undefined);
 }
 
 function finishHotkeyCapture(spec: string, label: string) {
