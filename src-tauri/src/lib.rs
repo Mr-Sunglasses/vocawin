@@ -2190,10 +2190,67 @@ fn delete_model(model_id: String, state: State<'_, AppState>) -> Result<(), Stri
     Ok(())
 }
 
+/// Converts the take to the 16 kHz the models expect with a band-limited FFT
+/// resampler (rubato, as Handy uses). Plain interpolation let everything
+/// between 8 kHz and the mic's Nyquist fold back into the speech band.
 fn resample_to_16khz(samples: &[f32], source_rate: u32) -> Vec<f32> {
-    if source_rate == 16_000 {
+    if source_rate == 16_000 || samples.is_empty() {
         return samples.to_vec();
     }
+    let expected = (samples.len() as u64 * 16_000 / source_rate as u64) as usize;
+    match fft_resample(samples, source_rate as usize, 16_000, expected) {
+        Ok(output) => output,
+        Err(error) => {
+            logbuf::warn(format!("Resampler failed ({error}); using interpolation."));
+            interpolate_to_16khz(samples, source_rate)
+        }
+    }
+}
+
+/// Resamples a whole recording: every chunk, then the filter's tail, with
+/// its start-up delay dropped so the output lines up with the input.
+fn fft_resample(
+    samples: &[f32],
+    from: usize,
+    to: usize,
+    expected: usize,
+) -> Result<Vec<f32>, String> {
+    use rubato::{FftFixedIn, Resampler};
+    const CHUNK: usize = 1024;
+    let mut resampler =
+        FftFixedIn::<f32>::new(from, to, CHUNK, 2, 1).map_err(|error| error.to_string())?;
+    let delay = resampler.output_delay();
+    let mut output = Vec::with_capacity(expected + delay + CHUNK);
+    let mut chunks = samples.chunks_exact(CHUNK);
+    for chunk in &mut chunks {
+        let resampled = resampler
+            .process(&[chunk], None)
+            .map_err(|error| error.to_string())?;
+        output.extend_from_slice(&resampled[0]);
+    }
+    let rest = chunks.remainder();
+    if !rest.is_empty() {
+        let resampled = resampler
+            .process_partial(Some(&[rest]), None)
+            .map_err(|error| error.to_string())?;
+        output.extend_from_slice(&resampled[0]);
+    }
+    while output.len() < expected + delay {
+        let resampled = resampler
+            .process_partial::<&[f32]>(None, None)
+            .map_err(|error| error.to_string())?;
+        if resampled[0].is_empty() {
+            break;
+        }
+        output.extend_from_slice(&resampled[0]);
+    }
+    output.drain(..delay.min(output.len()));
+    output.resize(expected, 0.0);
+    Ok(output)
+}
+
+/// The old linear interpolation, kept only as a fallback.
+fn interpolate_to_16khz(samples: &[f32], source_rate: u32) -> Vec<f32> {
     let output_length = (samples.len() as u64 * 16_000 / source_rate as u64) as usize;
     (0..output_length)
         .map(|index| {
@@ -4599,14 +4656,56 @@ mod tests {
         }
     }
 
+    fn tone(hz: f32, rate: u32, seconds: f32) -> Vec<f32> {
+        (0..(rate as f32 * seconds) as usize)
+            .map(|i| 0.5 * (2.0 * std::f32::consts::PI * hz * i as f32 / rate as f32).sin())
+            .collect()
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
     #[test]
     fn resampling_preserves_duration() {
-        let input = vec![0.5; 48_000];
+        for rate in [48_000, 44_100, 22_050, 8_000] {
+            let input = vec![0.5; rate as usize];
+            let output = resample_to_16khz(&input, rate);
+            assert_eq!(output.len(), 16_000, "{rate}");
+            // Away from the edges, a constant stays constant.
+            assert!(
+                output[800..15_200].iter().all(|sample| (*sample - 0.5).abs() < 1e-3),
+                "{rate}"
+            );
+        }
+        assert_eq!(resample_to_16khz(&[0.25; 100], 16_000), vec![0.25; 100]);
+    }
+
+    #[test]
+    fn resampling_keeps_speech_and_drops_what_would_alias() {
+        // 1 kHz is speech band and passes; 12 kHz is above 16 kHz's Nyquist
+        // and must vanish, where interpolation folded it down to 4 kHz.
+        let speech = resample_to_16khz(&tone(1_000.0, 48_000, 1.0), 48_000);
+        assert!((rms(&speech[1_000..15_000]) - 0.354).abs() < 0.01);
+        let high = resample_to_16khz(&tone(12_000.0, 48_000, 1.0), 48_000);
+        assert!(rms(&high[1_000..15_000]) < 0.01, "{}", rms(&high[1_000..15_000]));
+        let folded = interpolate_to_16khz(&tone(12_000.0, 48_000, 1.0), 48_000);
+        assert!(rms(&folded[1_000..15_000]) > 0.1);
+    }
+
+    #[test]
+    fn resampling_keeps_timing() {
+        // A click at 0.5 s lands at 0.5 s: the filter delay is removed.
+        let mut input = vec![0.0; 48_000];
+        input[24_000] = 1.0;
         let output = resample_to_16khz(&input, 48_000);
-        assert_eq!(output.len(), 16_000);
-        assert!(output
+        let peak = output
             .iter()
-            .all(|sample| (*sample - 0.5).abs() < f32::EPSILON));
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .unwrap()
+            .0;
+        assert!((7_998..=8_002).contains(&peak), "{peak}");
     }
 
     #[test]
