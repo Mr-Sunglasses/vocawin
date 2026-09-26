@@ -61,7 +61,7 @@ This is a tester build you can run today. It is not a store listing and not a st
 - **On-screen pill** - A "VocaWin is ready" pill for a few seconds after launch, and a live level while you speak. It never takes focus.
 - **Text rules on this PC** - Removes "um" and "uh" and keeps only the fix when you correct yourself ("tomorrow, no, Wednesday"). Optional spoken numbers ("twenty three" → 23), symbols, and emoji ("party emoji" → 🎉). A personal dictionary and snippets work with every model. Numbers and emoji are English only.
 - **History and stats** - Search, copy, replay, and retry past takes. Audio is saved before transcribing, so a crash does not lose what you said. Usage stats with streaks and time saved. All local, with 1-day to forever retention.
-- **Audio** - Silence is trimmed before the model runs, found by the bundled Silero voice detector (MIT, 1.8 MB) as on VocaMac; a take with only keyboard noise or silence is not decoded. Other apps can be muted while you record.
+- **Audio** - Silence is trimmed before the model runs, found by the Silero voice detector as on VocaMac (MIT, 1.8 MB, fetched with your first model Download); a take with only keyboard noise or silence is not decoded. Other apps can be muted while you record.
 
 ### Still rough
 

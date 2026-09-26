@@ -46,6 +46,10 @@ The same model as VocaMac's Voca Hinglish: Oriserve's Hindi2Hinglish Apex, a Whi
 
 It always decodes as English, which is how it was trained to write romanized Hindi, so it ignores the language setting. Its text goes through the text rules as Hindi, so English cleanup does not respell Hindi words. Letters outside Latin and Devanagari are decoder garbage and are removed (`src-tauri/src/hinglish.rs`, matching VocaMac). On silence or room noise the model writes `nan`, so a take that is only `nan` counts as no speech.
 
+## Voice detector
+
+Skip Silence finds speech with Silero VAD v4 ([snakers4/silero-vad](https://github.com/snakers4/silero-vad), MIT, 1.8 MB), as VocaMac does. It is not in the installer: the first model Download also fetches `silero_vad_v4.onnx` from the v4.0 release and checks its SHA-256. Until it is there, silence is trimmed by loudness.
+
 ## Long takes
 
 Canary, Cohere, Moonshine and GigaAM get takes longer than 20 seconds in windows of up to about 25 seconds, cut in pauses, and the window texts are joined (`src-tauri/src/chunking.rs`). Decoded whole, Canary skips sentences once real speech runs past roughly 40 seconds, Moonshine repeats a phrase and rejects anything over 64 seconds, GigaAM's encoder rejects anything over 200 seconds, and Cohere stops after 512 tokens. Whisper already decodes in 30-second windows. Parakeet and SenseVoice decode the whole take.
