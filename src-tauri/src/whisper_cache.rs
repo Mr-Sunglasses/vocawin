@@ -232,8 +232,9 @@ fn run_transcribe(
 /// A segment's text without whisper.cpp's non-speech markers. On silence or
 /// noise Whisper writes tags such as `[BLANK_AUDIO]`, `[ Silence ]`,
 /// `(music)` or `*sigh*` as ordinary text, and typing them is never right.
-/// Square brackets are always markers; parentheses and asterisks count only
-/// when they are all the segment holds, since spoken asides can use them.
+/// Inside speech only all-caps tags (`[BLANK_AUDIO]`, `[MUSIC PLAYING]`) go;
+/// other bracketed, parenthesized or starred text goes only when it is all
+/// the segment holds, so words written that way in a sentence are kept.
 fn spoken_text(segment: &str) -> String {
     let mut kept = String::with_capacity(segment.len());
     let mut rest = segment;
@@ -241,7 +242,11 @@ fn spoken_text(segment: &str) -> String {
         let Some(close) = rest[open..].find(']') else {
             break;
         };
+        let tag = &rest[open + 1..open + close];
         kept.push_str(&rest[..open]);
+        if !is_caps_tag(tag) {
+            kept.push_str(&rest[open..=open + close]);
+        }
         rest = &rest[open + close + 1..];
     }
     kept.push_str(rest);
@@ -253,8 +258,16 @@ fn spoken_text(segment: &str) -> String {
     }
 }
 
-/// True when nothing but `(...)` / `*...*` asides, music notes and
-/// punctuation is left.
+/// `BLANK_AUDIO`, `MUSIC PLAYING`: letters, all capitals.
+fn is_caps_tag(tag: &str) -> bool {
+    tag.chars().any(char::is_alphabetic)
+        && tag
+            .chars()
+            .all(|ch| ch.is_uppercase() || ch == '_' || ch == ' ' || ch == '-')
+}
+
+/// True when nothing but closed `[...]` / `(...)` / `*...*` groups, music
+/// notes and punctuation is left. A group that never closes is speech.
 fn only_markers(text: &str) -> bool {
     let mut inside: Option<char> = None;
     for ch in text.chars() {
@@ -262,6 +275,7 @@ fn only_markers(text: &str) -> bool {
             Some(close) if ch == close => inside = None,
             Some(_) => {}
             None => match ch {
+                '[' => inside = Some(']'),
                 '(' => inside = Some(')'),
                 '*' => inside = Some('*'),
                 _ if ch.is_alphanumeric() => return false,
@@ -269,7 +283,7 @@ fn only_markers(text: &str) -> bool {
             },
         }
     }
-    true
+    inside.is_none()
 }
 
 #[cfg(test)]
@@ -300,5 +314,8 @@ mod tests {
         assert_eq!(spoken_text("Call me (maybe) later"), "Call me (maybe) later");
         assert_eq!(spoken_text("Five * three"), "Five * three");
         assert_eq!(spoken_text("an open [bracket"), "an open [bracket");
+        assert_eq!(spoken_text("this is [important] now"), "this is [important] now");
+        assert_eq!(spoken_text("* more words"), "* more words");
+        assert_eq!(spoken_text("(and then"), "(and then");
     }
 }
