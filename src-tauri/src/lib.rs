@@ -3731,6 +3731,8 @@ pub fn run() {
             get_hotkey_presets,
             pause_hotkey_listener,
             resume_hotkey_listener,
+            start_hotkey_capture,
+            stop_hotkey_capture,
             list_input_devices,
             recommend_model,
             get_runtime_status,
@@ -3824,6 +3826,20 @@ fn pause_hotkey_listener() {
 #[tauri::command]
 fn resume_hotkey_listener() {
     hook::set_capture_paused(false);
+}
+
+/// Record a shortcut in the keyboard hook, which sees keys an IME or the
+/// webview would take (Ctrl+Space). The result arrives as
+/// `hotkey-captured`. False when the hook is not running, and the page
+/// records keys itself.
+#[tauri::command]
+fn start_hotkey_capture() -> bool {
+    hook::begin_capture()
+}
+
+#[tauri::command]
+fn stop_hotkey_capture() {
+    hook::end_capture();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

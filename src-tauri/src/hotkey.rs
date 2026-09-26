@@ -102,20 +102,13 @@ fn parse_combo(spec: &str) -> Result<HotkeySpec, String> {
                         .into(),
                 );
             }
-            "space" => key = Some(VK_SPACE),
-            "f7" => key = Some(VK_F7),
-            "f8" => key = Some(VK_F8),
-            "f9" => key = Some(VK_F9),
-            "f10" => key = Some(VK_F10),
-            other if other.len() == 1 => {
-                let ch = other.chars().next().unwrap().to_ascii_uppercase();
-                if ch.is_ascii_alphanumeric() {
-                    key = Some(ch as u32);
-                } else {
-                    return Err(format!("Unsupported hotkey key '{part}'"));
+            other => match key_vk(other) {
+                Some(vk) => key = Some(vk),
+                None if other.chars().count() == 1 => {
+                    return Err(format!("Unsupported hotkey key '{part}'"))
                 }
-            }
-            _ => return Err(format!("Unsupported hotkey part '{part}'")),
+                None => return Err(format!("Unsupported hotkey part '{part}'")),
+            },
         }
     }
     let vk = key.ok_or_else(|| format!("Hotkey '{spec}' is missing a key"))?;
@@ -196,17 +189,104 @@ fn lone_id(vk: u32) -> Option<String> {
 }
 
 fn key_token(vk: u32) -> String {
+    key_name(vk).unwrap_or_else(|| format!("Vk{vk}"))
+}
+
+/// Named keys besides letters, digits and F1-F24, with their virtual-key
+/// codes. Punctuation uses the US-layout character on the key.
+const NAMED_KEYS: &[(&str, u32)] = &[
+    ("Space", VK_SPACE),
+    ("PageUp", 0x21),
+    ("PageDown", 0x22),
+    ("End", 0x23),
+    ("Home", 0x24),
+    ("Left", 0x25),
+    ("Up", 0x26),
+    ("Right", 0x27),
+    ("Down", 0x28),
+    ("Insert", 0x2D),
+    ("Delete", 0x2E),
+    ("Pause", 0x13),
+    ("ScrollLock", 0x91),
+    (";", 0xBA),
+    ("=", 0xBB),
+    (",", 0xBC),
+    ("-", 0xBD),
+    (".", 0xBE),
+    ("/", 0xBF),
+    ("`", 0xC0),
+    ("[", 0xDB),
+    ("\\", 0xDC),
+    ("]", 0xDD),
+    ("'", 0xDE),
+];
+
+/// The settings name of a key a shortcut can use, if it has one.
+fn key_name(vk: u32) -> Option<String> {
     match vk {
-        VK_SPACE => "Space".into(),
-        VK_F7 => "F7".into(),
-        VK_F8 => "F8".into(),
-        VK_F9 => "F9".into(),
-        VK_F10 => "F10".into(),
-        v if (0x30..=0x39).contains(&v) || (0x41..=0x5A).contains(&v) => {
-            char::from_u32(v).unwrap_or('?').to_string()
-        }
-        other => format!("Vk{other}"),
+        0x30..=0x39 | 0x41..=0x5A => char::from_u32(vk).map(|ch| ch.to_string()),
+        0x70..=0x87 => Some(format!("F{}", vk - 0x6F)),
+        _ => NAMED_KEYS
+            .iter()
+            .find(|(_, code)| *code == vk)
+            .map(|(name, _)| (*name).to_string()),
     }
+}
+
+/// The virtual-key code for a key name (any case).
+fn key_vk(name: &str) -> Option<u32> {
+    let upper = name.to_ascii_uppercase();
+    let mut chars = upper.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        if ch.is_ascii_alphanumeric() {
+            return Some(ch as u32);
+        }
+    }
+    if let Some(number) = upper.strip_prefix('F').and_then(|rest| rest.parse::<u32>().ok()) {
+        if (1..=24).contains(&number) {
+            return Some(0x6F + number);
+        }
+    }
+    NAMED_KEYS
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, vk)| *vk)
+}
+
+/// Keys that are fine to hold on their own: they type nothing and move
+/// nothing, so eating them while dictating costs the user no input.
+fn lone_key_is_safe(vk: u32) -> bool {
+    matches!(vk, 0x70..=0x87 | 0x2D | 0x13 | 0x91)
+}
+
+/// The shortcut for keys held together while recording one in Settings:
+/// a lone Right/Left Ctrl, Alt or Shift, or modifiers plus one key. A key
+/// that types or moves the caret needs Ctrl or Alt, since dictation eats it
+/// while held.
+pub fn from_keys(ctrl: bool, alt: bool, shift: bool, vk: u32) -> Result<String, String> {
+    if is_modifier_vk(vk) {
+        return lone_id(vk).ok_or_else(|| "That modifier cannot be a shortcut.".to_string());
+    }
+    let Some(name) = key_name(vk) else {
+        return Err("That key cannot be part of a shortcut. Try a letter, number, F-key or Space with Ctrl or Alt.".into());
+    };
+    if !ctrl && !alt && !lone_key_is_safe(vk) {
+        return Err(format!(
+            "{name} types or moves the caret. Hold Ctrl or Alt with it, for example Ctrl+{name}."
+        ));
+    }
+    let mut parts = Vec::new();
+    if ctrl {
+        parts.push("Ctrl".to_string());
+    }
+    if alt {
+        parts.push("Alt".to_string());
+    }
+    if shift {
+        parts.push("Shift".to_string());
+    }
+    parts.push(name);
+    canonicalize(&parts.join("+"))
 }
 
 #[cfg(test)]
@@ -259,6 +339,36 @@ mod tests {
                 vk: VK_SPACE
             }
         );
+    }
+
+    #[test]
+    fn recorded_keys_become_shortcuts() {
+        assert_eq!(from_keys(true, false, false, VK_SPACE).unwrap(), "Ctrl+Space");
+        assert_eq!(from_keys(true, true, false, VK_SPACE).unwrap(), "Ctrl+Alt+Space");
+        assert_eq!(from_keys(false, true, true, 0x44).unwrap(), "Alt+Shift+D");
+        assert_eq!(from_keys(false, false, false, VK_F9).unwrap(), "F9");
+        assert_eq!(from_keys(false, false, false, 0x7B).unwrap(), "F12");
+        assert_eq!(from_keys(true, false, false, 0xC0).unwrap(), "Ctrl+`");
+        assert_eq!(from_keys(false, false, false, VK_RCONTROL).unwrap(), "ControlRight");
+        assert_eq!(from_keys(false, false, false, VK_LMENU).unwrap(), "AltLeft");
+    }
+
+    #[test]
+    fn keys_that_type_need_ctrl_or_alt() {
+        for vk in [VK_SPACE, 0x41, 0x35, 0x25, 0xBC] {
+            assert!(from_keys(false, false, false, vk).is_err(), "{vk:#x}");
+            assert!(from_keys(false, false, true, vk).is_err(), "{vk:#x}");
+        }
+        assert!(from_keys(true, false, false, 0x0D).is_err());
+    }
+
+    #[test]
+    fn new_key_names_round_trip() {
+        for spec in ["Ctrl+F12", "Alt+PageDown", "Ctrl+Shift+/", "F24", "Ctrl+\\", "Ctrl+Alt+Left"] {
+            assert_eq!(canonicalize(spec).unwrap(), spec, "{spec}");
+        }
+        assert_eq!(canonicalize("ctrl+space").unwrap(), "Ctrl+Space");
+        assert_eq!(canonicalize("F8").unwrap(), "F8");
     }
 
     #[test]

@@ -21,6 +21,12 @@
 //! and the hands-free and paste-last shortcuts fire once per press. A
 //! WH_MOUSE_LL hook is installed only while a mouse button is bound, so the
 //! middle or side buttons can dictate like the hotkey.
+//!
+//! Settings' Record button captures a new shortcut here too (`begin_capture`),
+//! as Handy does: the hook sees keys before an IME or the webview can take
+//! them (Ctrl+Space never reached the page), with the side of each modifier.
+//! Captured keys are eaten until they come up; Escape cancels, and a capture
+//! nobody finishes lets go after `CAPTURE_TIMEOUT`.
 
 #![allow(dead_code)] // Hook symbols are Windows-only; Linux CI still typechecks the module.
 
@@ -28,8 +34,8 @@ use crate::hotkey::HotkeySpec;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
-use tauri::AppHandle;
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter};
 
 // Aggregate modifier VKs used with GetAsyncKeyState for combos.
 const VK_SHIFT: i32 = 0x10;
@@ -52,6 +58,11 @@ const WM_XBUTTONUP: u32 = 0x020C;
 const LLMHF_INJECTED: u32 = 0x01;
 /// Posted to the hook thread when the mouse binding changes.
 const WM_APP_MOUSE_BINDING: u32 = 0x8000 + 1;
+
+/// A shortcut capture nobody finishes stops eating keys after this long.
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
+const VK_LWIN: u32 = 0x5B;
+const VK_RWIN: u32 = 0x5C;
 
 /// Mac uses max recording + 5s. Default max is 60s, so 65s.
 pub const DEFAULT_SAFETY_TIMEOUT: Duration = Duration::from_secs(65);
@@ -86,6 +97,122 @@ impl MouseButton {
             "x1" | "back" => Some(Self::X1),
             "x2" | "forward" => Some(Self::X2),
             _ => None,
+        }
+    }
+}
+
+/// How a shortcut capture ended, sent to Settings as `hotkey-captured`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "camelCase")]
+pub enum CaptureOutcome {
+    /// The canonical settings string, such as "Ctrl+Space" or "AltRight".
+    Shortcut(String),
+    /// Keys that cannot be a shortcut; capture keeps listening.
+    Refused(String),
+    Cancelled,
+}
+
+/// Keys seen while Settings records a shortcut.
+#[derive(Debug)]
+struct Capture {
+    started: Instant,
+    /// Keys down now whose up must be eaten too.
+    held: Vec<u32>,
+    /// Modifiers pressed in this attempt, for a lone-modifier shortcut.
+    modifiers: Vec<u32>,
+    /// A shortcut was taken or the capture cancelled; only ups are eaten.
+    finished: bool,
+}
+
+impl Capture {
+    fn new(now: Instant) -> Self {
+        Self {
+            started: now,
+            held: Vec::new(),
+            modifiers: Vec::new(),
+            finished: false,
+        }
+    }
+}
+
+/// One key event during a capture: whether to eat it, and any outcome.
+fn capture_step(capture: &mut Capture, vk: u32, edge: KeyEdge) -> (bool, Option<CaptureOutcome>) {
+    use crate::hotkey::is_modifier_vk;
+    match edge {
+        KeyEdge::Other => (false, None),
+        KeyEdge::Up => {
+            let Some(position) = capture.held.iter().position(|held| *held == vk) else {
+                return (false, None);
+            };
+            capture.held.remove(position);
+            let modifiers_up = !capture.held.iter().any(|held| is_modifier_vk(*held));
+            if capture.finished || !is_modifier_vk(vk) || !modifiers_up || capture.modifiers.is_empty() {
+                return (true, None);
+            }
+            // Only modifiers were pressed, and all are up again.
+            let pressed = std::mem::take(&mut capture.modifiers);
+            if pressed.len() == 1 {
+                match crate::hotkey::from_keys(false, false, false, pressed[0]) {
+                    Ok(spec) => {
+                        capture.finished = true;
+                        (true, Some(CaptureOutcome::Shortcut(spec)))
+                    }
+                    Err(error) => (true, Some(CaptureOutcome::Refused(error))),
+                }
+            } else {
+                (
+                    true,
+                    Some(CaptureOutcome::Refused(
+                        "Modifiers alone only work one at a time, such as Right Alt. Add a key, for example Ctrl+Space.".into(),
+                    )),
+                )
+            }
+        }
+        KeyEdge::Down if capture.finished => {
+            // Typematic repeats of a captured key stay eaten; anything new
+            // belongs to the user again.
+            (capture.held.contains(&vk), None)
+        }
+        KeyEdge::Down => {
+            if !capture.held.contains(&vk) {
+                capture.held.push(vk);
+            }
+            if is_modifier_vk(vk) {
+                if !capture.modifiers.contains(&vk) {
+                    capture.modifiers.push(vk);
+                }
+                return (true, None);
+            }
+            let held_modifiers: Vec<u32> = capture
+                .held
+                .iter()
+                .copied()
+                .filter(|held| is_modifier_vk(*held))
+                .collect();
+            if vk == VK_ESCAPE && held_modifiers.is_empty() {
+                capture.finished = true;
+                return (true, Some(CaptureOutcome::Cancelled));
+            }
+            // Whatever happens, this press is not a lone-modifier shortcut.
+            capture.modifiers.clear();
+            if vk == VK_LWIN || vk == VK_RWIN {
+                return (
+                    true,
+                    Some(CaptureOutcome::Refused(
+                        "Win/Super shortcuts are reserved on Windows. Pick another key.".into(),
+                    )),
+                );
+            }
+            let ctrl = held_modifiers.iter().any(|held| is_ctrl_vk(*held));
+            let alt = held_modifiers.iter().any(|held| is_alt_vk(*held));
+            let shift = held_modifiers.iter().any(|held| is_shift_vk(*held));
+            match crate::hotkey::from_keys(ctrl, alt, shift, vk) {
+                Ok(spec) => {
+                    capture.finished = true;
+                    (true, Some(CaptureOutcome::Shortcut(spec)))
+                }
+                Err(error) => (true, Some(CaptureOutcome::Refused(error))),
+            }
         }
     }
 }
@@ -157,10 +284,13 @@ struct HookShared {
     escape_swallowed: bool,
     mouse_button: Option<MouseButton>,
     mouse_held: bool,
+    /// Settings is recording a new shortcut.
+    capture: Option<Capture>,
 }
 
 enum ActorMsg {
     Event(HookEvent),
+    Captured(CaptureOutcome),
     /// Bound-side key-up only, and only after the hook has returned.
     Unstick(u32),
 }
@@ -187,6 +317,7 @@ fn shared() -> &'static Mutex<HookShared> {
             escape_swallowed: false,
             mouse_button: None,
             mouse_held: false,
+            capture: None,
         })
     })
 }
@@ -207,6 +338,9 @@ pub fn start(app: AppHandle) {
             while let Ok(msg) = rx.recv() {
                 match msg {
                     ActorMsg::Event(event) => crate::on_hotkey_event(&app, event),
+                    ActorMsg::Captured(outcome) => {
+                        let _ = app.emit("hotkey-captured", outcome);
+                    }
                     ActorMsg::Unstick(vk) => unstick_modifier(vk),
                 }
             }
@@ -252,6 +386,58 @@ pub fn clear_binding() {
         emit_released();
         queue_unstick(vk);
     }
+}
+
+/// Start capturing a shortcut for Settings. Dictation shortcuts pause until
+/// `end_capture`. False when the hook is not running (other platforms), so
+/// the page records keys itself.
+pub fn begin_capture() -> bool {
+    let mut guard = shared().lock().unwrap_or_else(|e| e.into_inner());
+    guard.capture_paused = true;
+    if !cfg!(windows) || !HOOK_ACTIVE.load(Ordering::SeqCst) {
+        return false;
+    }
+    guard.capture = Some(Capture::new(Instant::now()));
+    true
+}
+
+/// Stop capturing and let dictation shortcuts work again. A finished
+/// capture still eats the ups of the keys it took, then clears itself.
+pub fn end_capture() {
+    let mut guard = shared().lock().unwrap_or_else(|e| e.into_inner());
+    if guard.capture.as_ref().is_some_and(|capture| !capture.finished) {
+        guard.capture = None;
+    }
+    guard.capture_paused = false;
+}
+
+fn send_captured(outcome: CaptureOutcome) {
+    if let Some(tx) = ACTOR_TX.get() {
+        let _ = tx.send(ActorMsg::Captured(outcome));
+    }
+}
+
+/// Runs a key through an active capture. `Some(eat)` when the capture
+/// handled it; `None` when no capture is running (or it just timed out).
+fn capture_key(guard: &mut HookShared, vk: u32, edge: KeyEdge, now: Instant) -> Option<bool> {
+    let capture = guard.capture.as_mut()?;
+    if now.duration_since(capture.started) >= CAPTURE_TIMEOUT {
+        let finished = capture.finished;
+        guard.capture = None;
+        if !finished {
+            guard.capture_paused = false;
+            send_captured(CaptureOutcome::Cancelled);
+        }
+        return None;
+    }
+    let (eat, outcome) = capture_step(capture, vk, edge);
+    if capture.finished && capture.held.is_empty() {
+        guard.capture = None;
+    }
+    if let Some(outcome) = outcome {
+        send_captured(outcome);
+    }
+    Some(eat)
 }
 
 pub fn set_capture_paused(paused: bool) {
@@ -556,6 +742,12 @@ unsafe extern "system" fn low_level_proc(
             Err(poisoned) => poisoned.into_inner(),
         };
 
+        if let Some(eat) = capture_key(&mut guard, vk, edge, Instant::now()) {
+            if eat {
+                return LRESULT(1);
+            }
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
         match escape_action(&mut guard, vk, edge) {
             SpecialAction::Pass => {}
             SpecialAction::Swallow => return LRESULT(1),
@@ -1049,7 +1241,121 @@ mod tests {
             escape_swallowed: false,
             mouse_button: None,
             mouse_held: false,
+            capture: None,
         }
+    }
+
+    use crate::hotkey::{VK_LCONTROL, VK_LSHIFT, VK_RCONTROL, VK_SPACE};
+
+    fn run(capture: &mut Capture, keys: &[(u32, KeyEdge)]) -> Vec<(bool, Option<CaptureOutcome>)> {
+        keys.iter().map(|(vk, edge)| capture_step(capture, *vk, *edge)).collect()
+    }
+
+    fn shortcut(spec: &str) -> Option<CaptureOutcome> {
+        Some(CaptureOutcome::Shortcut(spec.into()))
+    }
+
+    #[test]
+    fn ctrl_space_is_captured_and_its_keys_are_eaten_until_up() {
+        let mut capture = Capture::new(Instant::now());
+        let steps = run(
+            &mut capture,
+            &[
+                (VK_LCONTROL, KeyEdge::Down),
+                (VK_LCONTROL, KeyEdge::Down),
+                (VK_SPACE, KeyEdge::Down),
+                (VK_SPACE, KeyEdge::Down),
+                (VK_SPACE, KeyEdge::Up),
+                (VK_LCONTROL, KeyEdge::Up),
+            ],
+        );
+        assert_eq!(steps[2], (true, shortcut("Ctrl+Space")));
+        assert!(steps.iter().all(|(eat, _)| *eat));
+        assert_eq!(steps.iter().filter(|(_, outcome)| outcome.is_some()).count(), 1);
+        assert!(capture.finished && capture.held.is_empty());
+        // After the capture, new keys belong to the user.
+        assert_eq!(capture_step(&mut capture, 0x41, KeyEdge::Down), (false, None));
+    }
+
+    #[test]
+    fn a_lone_modifier_is_captured_on_release_with_its_side() {
+        let mut capture = Capture::new(Instant::now());
+        let steps = run(&mut capture, &[(VK_RMENU, KeyEdge::Down), (VK_RMENU, KeyEdge::Up)]);
+        assert_eq!(steps[1], (true, shortcut("AltRight")));
+        let mut capture = Capture::new(Instant::now());
+        let steps = run(&mut capture, &[(VK_LSHIFT, KeyEdge::Down), (VK_LSHIFT, KeyEdge::Up)]);
+        assert_eq!(steps[1], (true, shortcut("ShiftLeft")));
+    }
+
+    #[test]
+    fn two_modifiers_alone_are_refused_and_capture_goes_on() {
+        let mut capture = Capture::new(Instant::now());
+        let steps = run(
+            &mut capture,
+            &[
+                (VK_LCONTROL, KeyEdge::Down),
+                (VK_RMENU, KeyEdge::Down),
+                (VK_RMENU, KeyEdge::Up),
+                (VK_LCONTROL, KeyEdge::Up),
+            ],
+        );
+        assert!(matches!(steps[3].1, Some(CaptureOutcome::Refused(_))));
+        assert!(!capture.finished);
+        let steps = run(&mut capture, &[(VK_RCONTROL, KeyEdge::Down), (VK_RCONTROL, KeyEdge::Up)]);
+        assert_eq!(steps[1], (true, shortcut("ControlRight")));
+    }
+
+    #[test]
+    fn a_refused_key_does_not_turn_into_a_lone_modifier() {
+        let mut capture = Capture::new(Instant::now());
+        let steps = run(
+            &mut capture,
+            &[
+                (VK_LSHIFT, KeyEdge::Down),
+                (0x41, KeyEdge::Down),
+                (0x41, KeyEdge::Up),
+                (VK_LSHIFT, KeyEdge::Up),
+            ],
+        );
+        assert!(matches!(steps[1].1, Some(CaptureOutcome::Refused(_))));
+        assert_eq!(steps[3], (true, None));
+        assert!(!capture.finished);
+    }
+
+    #[test]
+    fn escape_cancels_but_escape_with_a_modifier_is_refused() {
+        let mut capture = Capture::new(Instant::now());
+        assert_eq!(
+            capture_step(&mut capture, VK_ESCAPE, KeyEdge::Down),
+            (true, Some(CaptureOutcome::Cancelled))
+        );
+        assert_eq!(capture_step(&mut capture, VK_ESCAPE, KeyEdge::Up), (true, None));
+        assert!(capture.held.is_empty());
+        let mut capture = Capture::new(Instant::now());
+        let steps = run(&mut capture, &[(VK_LMENU, KeyEdge::Down), (VK_ESCAPE, KeyEdge::Down)]);
+        assert!(matches!(steps[1].1, Some(CaptureOutcome::Refused(_))));
+    }
+
+    #[test]
+    fn the_windows_key_is_refused() {
+        let mut capture = Capture::new(Instant::now());
+        let steps = run(&mut capture, &[(VK_LWIN, KeyEdge::Down), (VK_LWIN, KeyEdge::Up)]);
+        assert!(matches!(steps[0].1, Some(CaptureOutcome::Refused(_))));
+        assert_eq!(steps[1], (true, None));
+    }
+
+    #[test]
+    fn an_abandoned_capture_lets_go_after_the_timeout() {
+        let mut shared = test_shared();
+        let started = Instant::now();
+        shared.capture = Some(Capture::new(started));
+        shared.capture_paused = true;
+        assert_eq!(capture_key(&mut shared, 0x41, KeyEdge::Down, started), Some(true));
+        assert_eq!(
+            capture_key(&mut shared, 0x42, KeyEdge::Down, started + CAPTURE_TIMEOUT),
+            None
+        );
+        assert!(shared.capture.is_none() && !shared.capture_paused);
     }
 
     #[test]

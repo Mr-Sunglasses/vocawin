@@ -10,7 +10,7 @@ The tagged cut ships an NSIS `.exe` (current-user). MSI is paused while the vers
 
 The first run opens a short setup guide: pick your language, download a suggested speech-to-text model, and try a first dictation. The download uses the network once. After that, audio stays on this PC. You can run the guide again from General.
 
-Hold Right Alt to dictate, the same hold-default as VocaLinux. AltGr is left alone. Press Escape while speaking to throw a take away. On the Shortcuts page you can change the hotkey, add a hands-free start/stop shortcut, dictate with a middle or side mouse button, or bind a shortcut that types your last dictation again.
+Hold Right Alt to dictate, the same hold-default as VocaLinux. AltGr is left alone. Press Escape while speaking to throw a take away. On the Shortcuts page you can change the hotkey, add a hands-free start/stop shortcut, dictate with a middle or side mouse button, or bind a shortcut that types your last dictation again. Record takes whatever you press: one side key such as Right Alt or Left Ctrl, a function key, or Ctrl or Alt (plus Shift if you like) with a letter, number, F-key, arrow, punctuation key or Space, such as Ctrl+Space. A key that types on its own needs Ctrl or Alt, since dictation holds it back while you press it. Win/Super is reserved by Windows.
 
 A small pill shows at the bottom of the screen for a few seconds after VocaWin starts, since Windows often hides new tray icons. The same pill shows a live level while you speak and a spinner while a take is transcribed. It never takes focus from the app you are typing into. Turn either off in General.
 
