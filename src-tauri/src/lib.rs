@@ -2133,6 +2133,11 @@ async fn download_model(
                     .into(),
             );
         }
+        // Skip Silence's voice detector comes with the first model, as on
+        // VocaMac; without it trimming falls back to loudness.
+        if let Err(error) = vad::download(&state.models_path).await {
+            logbuf::warn(error);
+        }
         Ok::<(), String>(())
     }
     .await;
@@ -2845,8 +2850,8 @@ fn transcribe_samples(state: &AppState, samples: Vec<f32>, sample_rate: u32) -> 
 /// Silence trim, the model, then the text rules.
 fn recognize_and_format(state: &AppState, settings: &Settings, pcm: &[f32]) -> Result<String, String> {
     let audio = if settings.skip_silence {
-        let decision = vad::decide(pcm).unwrap_or_else(|error| {
-            logbuf::warn(format!("{error}; trimming silence by loudness instead."));
+        let decision = vad::decide(&state.models_path, pcm).unwrap_or_else(|error| {
+            logbuf::debug(format!("{error}; trimming silence by loudness instead."));
             silence::decide(pcm)
         });
         match decision {
