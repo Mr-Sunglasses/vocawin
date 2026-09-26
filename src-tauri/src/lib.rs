@@ -527,7 +527,8 @@ fn open_input_stream(
     last_voice_ms: Arc<Mutex<u128>>,
     heard_speech: Arc<Mutex<bool>>,
     peak_level: Arc<Mutex<f32>>,
-    store_samples: bool,
+    store: Arc<AtomicBool>,
+    last_audio_ms: Arc<std::sync::atomic::AtomicU64>,
     device_name: &str,
 ) -> Result<(cpal::Stream, u32), String> {
     let host = cpal::default_host();
@@ -564,9 +565,13 @@ fn open_input_stream(
             let last_voice_ms = Arc::clone(&last_voice_ms);
             let heard_speech = Arc::clone(&heard_speech);
             let peak_level = Arc::clone(&peak_level);
+            let store = Arc::clone(&store);
+            let last_audio_ms = Arc::clone(&last_audio_ms);
             device.build_input_stream(
                 &config,
                 move |data: &[f32], _| {
+                    last_audio_ms.store(now_ms() as u64, Ordering::Relaxed);
+                    let store_samples = store.load(Ordering::Relaxed);
                     for frame in data.chunks(channels) {
                         let mono = frame.iter().sum::<f32>() / frame.len() as f32;
                         note_audio_sample(
@@ -588,9 +593,13 @@ fn open_input_stream(
             let last_voice_ms = Arc::clone(&last_voice_ms);
             let heard_speech = Arc::clone(&heard_speech);
             let peak_level = Arc::clone(&peak_level);
+            let store = Arc::clone(&store);
+            let last_audio_ms = Arc::clone(&last_audio_ms);
             device.build_input_stream(
                 &config,
                 move |data: &[i16], _| {
+                    last_audio_ms.store(now_ms() as u64, Ordering::Relaxed);
+                    let store_samples = store.load(Ordering::Relaxed);
                     for frame in data.chunks(channels) {
                         let mono = frame
                             .iter()
@@ -616,9 +625,13 @@ fn open_input_stream(
             let last_voice_ms = Arc::clone(&last_voice_ms);
             let heard_speech = Arc::clone(&heard_speech);
             let peak_level = Arc::clone(&peak_level);
+            let store = Arc::clone(&store);
+            let last_audio_ms = Arc::clone(&last_audio_ms);
             device.build_input_stream(
                 &config,
                 move |data: &[u16], _| {
+                    last_audio_ms.store(now_ms() as u64, Ordering::Relaxed);
+                    let store_samples = store.load(Ordering::Relaxed);
                     for frame in data.chunks(channels) {
                         let mono = frame
                             .iter()
@@ -656,12 +669,29 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
+/// An open microphone stream kept after a take (Handy's lazy close), so the
+/// next take starts at once instead of waiting for WASAPI to open.
+#[cfg(windows)]
+struct WarmStream {
+    stream: cpal::Stream,
+    rate: u32,
+    device: String,
+    idle_since_ms: u128,
+}
+
 #[cfg(windows)]
 fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
     let samples = Arc::new(Mutex::new(Vec::<f32>::new()));
     let last_voice_ms = Arc::new(Mutex::new(now_ms()));
     let heard_speech = Arc::new(Mutex::new(false));
     let peak_level = Arc::new(Mutex::new(0.0_f32));
+    // Whether the callback keeps samples (a take) or only meters (warm).
+    let store = Arc::new(AtomicBool::new(false));
+    // When the stream last delivered audio; a warm stream that went quiet
+    // (sleep, unplugged mic) is not reused.
+    let last_audio_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut warm: Option<WarmStream> = None;
+    let mut stream_device = String::new();
     let mut stream: Option<cpal::Stream> = None;
     let mut sample_rate: Option<u32> = None;
     let mut started_ms: Option<u128> = None;
@@ -692,21 +722,47 @@ fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
                             max_seconds = max.clamp(3.0, 300.0);
                             silence_auto_stop = enable_silence;
                             current_session = session;
-                            match open_input_stream(
-                                Arc::clone(&samples),
-                                Arc::clone(&last_voice_ms),
-                                Arc::clone(&heard_speech),
-                                Arc::clone(&peak_level),
-                                !meter,
-                                &device_name,
-                            ) {
+                            // The mic test always gets its own meter stream.
+                            let reusable = warm.take().filter(|kept| {
+                                !meter
+                                    && reuse_warm_stream(
+                                        &kept.device,
+                                        &device_name,
+                                        last_audio_ms.load(Ordering::Relaxed) as u128,
+                                        now_ms(),
+                                    )
+                            });
+                            let opened = match reusable {
+                                Some(kept) => {
+                                    if let Ok(mut buffer) = samples.lock() {
+                                        buffer.clear();
+                                    }
+                                    logbuf::debug("Microphone was still open; recording at once.");
+                                    Ok((kept.stream, kept.rate))
+                                }
+                                None => {
+                                    store.store(false, Ordering::Relaxed);
+                                    open_input_stream(
+                                        Arc::clone(&samples),
+                                        Arc::clone(&last_voice_ms),
+                                        Arc::clone(&heard_speech),
+                                        Arc::clone(&peak_level),
+                                        Arc::clone(&store),
+                                        Arc::clone(&last_audio_ms),
+                                        &device_name,
+                                    )
+                                    .inspect(|_| logbuf::debug("Microphone opened."))
+                                }
+                            };
+                            match opened {
                                 Ok((next_stream, rate)) => {
+                                    store.store(!meter, Ordering::Relaxed);
+                                    stream_device = device_name.clone();
                                     sample_rate = Some(rate);
                                     stream = Some(next_stream);
                                     started_ms = Some(now_ms());
                                     *last_voice_ms.lock().unwrap() = now_ms();
                                     *heard_speech.lock().unwrap() = false;
-                                    logbuf::debug("Microphone opened.");
                                     Ok(())
                                 }
                                 Err(error) => {
@@ -724,6 +780,7 @@ fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
                         let meter = meter_only;
                         meter_only = false;
                         let result = if meter {
+                            store.store(false, Ordering::Relaxed);
                             stream.take();
                             sample_rate.take();
                             started_ms = None;
@@ -732,7 +789,15 @@ fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
                             }
                             Ok((Vec::new(), 16_000))
                         } else {
-                            take_recording(&mut stream, &mut sample_rate, &mut started_ms, &samples)
+                            take_recording(
+                                &mut stream,
+                                &mut warm,
+                                &stream_device,
+                                &store,
+                                &mut sample_rate,
+                                &mut started_ms,
+                                &samples,
+                            )
                         };
                         if let Ok(mut peak) = peak_level.lock() {
                             *peak = 0.0;
@@ -753,6 +818,14 @@ fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
 
+        if warm
+            .as_ref()
+            .is_some_and(|kept| now_ms().saturating_sub(kept.idle_since_ms) >= WARM_MICROPHONE_MS)
+        {
+            warm = None;
+            logbuf::debug("Microphone closed after staying open unused.");
+        }
+
         if timed_out && stream.is_some() && !meter_only {
             let started = started_ms.unwrap_or_else(now_ms);
             let elapsed = (now_ms().saturating_sub(started)) as f32 / 1000.0;
@@ -762,7 +835,15 @@ fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
             let silence_hit = silence_auto_stop && heard && quiet_for >= silence_seconds;
             let max_hit = elapsed >= max_seconds;
             if silence_hit || max_hit {
-                match take_recording(&mut stream, &mut sample_rate, &mut started_ms, &samples) {
+                match take_recording(
+                    &mut stream,
+                    &mut warm,
+                    &stream_device,
+                    &store,
+                    &mut sample_rate,
+                    &mut started_ms,
+                    &samples,
+                ) {
                     Ok((pcm, rate)) => {
                         let app_for_finish = app.clone();
                         let session = current_session;
@@ -771,7 +852,7 @@ fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
                         });
                     }
                     Err(_) => {
-                        // take_recording already dropped the stream.
+                        // take_recording already ended the take.
                         clear_recording_after_capture_drop(&app);
                     }
                 }
@@ -780,18 +861,29 @@ fn audio_thread_main(commands: mpsc::Receiver<AudioCommand>, app: AppHandle) {
     }
 }
 
+/// Ends the take and keeps its stream open, no longer storing, for the next.
 #[cfg(windows)]
 fn take_recording(
     stream: &mut Option<cpal::Stream>,
+    warm: &mut Option<WarmStream>,
+    device: &str,
+    store: &AtomicBool,
     sample_rate: &mut Option<u32>,
     started_ms: &mut Option<u128>,
     samples: &Arc<Mutex<Vec<f32>>>,
 ) -> Result<(Vec<f32>, u32), String> {
-    if stream.take().is_none() {
+    store.store(false, Ordering::Relaxed);
+    let Some(live) = stream.take() else {
         return Err("No recording is in progress".into());
-    }
+    };
     *started_ms = None;
     let rate = sample_rate.take().unwrap_or(16_000);
+    *warm = Some(WarmStream {
+        stream: live,
+        rate,
+        device: device.to_string(),
+        idle_since_ms: now_ms(),
+    });
     match samples.lock() {
         Ok(mut buffer) => {
             let captured = std::mem::take(&mut *buffer);
@@ -2529,6 +2621,17 @@ fn mic_test_gate(recording_flag: bool, capture_live: bool) -> MicTestGate {
 fn is_stale_stop_error(error: &str) -> bool {
     error.contains("No recording is in progress")
         || error.contains("No microphone audio was captured")
+}
+
+/// How long the microphone stays open after a take (Handy uses 30 s). The
+/// next take in that time starts recording at once.
+const WARM_MICROPHONE_MS: u128 = 30_000;
+
+/// Whether a microphone kept open after a take can record the next one: the
+/// same device, and still delivering audio (a stream that went quiet across
+/// sleep or an unplugged mic is replaced).
+fn reuse_warm_stream(kept_device: &str, requested_device: &str, last_audio_ms: u128, now_ms: u128) -> bool {
+    kept_device == requested_device && now_ms.saturating_sub(last_audio_ms) <= 500
 }
 
 /// A failed Start must not flip an already-open stream from meter to dictation
@@ -4755,6 +4858,14 @@ mod tests {
         let (peak, len) = click_position(1024 * 48, 1024 * 48 - 1_440, 48_000);
         assert_eq!(len, 1024 * 48 / 3);
         assert!((len - 482..=len - 478).contains(&peak), "{peak} of {len}");
+    }
+
+    #[test]
+    fn a_warm_microphone_is_reused_only_while_it_still_delivers_audio() {
+        assert!(reuse_warm_stream("", "", 1_000, 1_200));
+        assert!(reuse_warm_stream("USB Mic", "USB Mic", 1_000, 1_500));
+        assert!(!reuse_warm_stream("USB Mic", "", 1_000, 1_200), "device changed");
+        assert!(!reuse_warm_stream("", "", 1_000, 2_000), "stream went quiet");
     }
 
     #[test]
